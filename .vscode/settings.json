@@ -1,0 +1,20 @@
+{
+  "chat.mcp.serverSampling": {
+    "MCPTest/.vscode/mcp.json: ghidra": {
+      "allowedModels": [
+        "copilot/gpt-4.1",
+        "copilot/claude-sonnet-4",
+        "copilot/gemini-2.5-pro"
+      ]
+    },
+    "MCPTest/.vscode/mcp.json: ghydra": {
+      "allowedModels": [
+        "copilot/gpt-5.2-codex",
+        "copilot/claude-sonnet-4.5",
+        "copilot/gemini-3-flash-preview",
+        "copilot/gemini-3-pro-preview",
+        "copilot/gpt-5.2"
+      ]
+    }
+  }
+}

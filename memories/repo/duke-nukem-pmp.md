@@ -1,0 +1,13 @@
+- Validate the Duke Nukem PMP extractor from `DukeNukem (SLUS_123.45)/PmpExtractor` with `dotnet run -- <PMP> <outDir> --level-chunks 10`.
+- `EPISODE1` PMP files consistently decode 10 level-data descriptors plus a raw ushort lookup tail after chunk 9.
+- Late chunk 8 is the texture-group table; late chunk 9 is the frame metadata table; the raw tail is the lookup-index array.
+- Resolved frame export now uses game frame tables for width/height, UV, tpage-group, anchor data, and CLUT lookup.
+- `EPISODE1` resolved frame tables currently export only `indexed4` and `indexed8` modes, not `rgba5551`.
+- `packed-gfx.bin` starts with an offset-table byte count; `groupCount = firstDword / 4`, and the count varies by level.
+- Packed-gfx-backed frames currently resolve as direct `indexed8` descriptors with zero UV across `EPISODE1`; in `E1L1`, 220 of 809 exported frames use that path.
+- Remaining suspicious colors are likely tied to the caller-provided palette override path (`DAT_800b2af4[param_2]`) rather than packed-gfx slicing.
+- Texture-window sampling in `SpriteFrameExtractor` must use local `x/y` coordinates; `StartU` and `StartV` are applied inside the helper already. Passing `U + x` / `V + y` double-applies the origin and breaks most atlas-backed frames.
+- `DAT_800d6200` carries per-frame anchor bytes. The validated extractor derivation is `OriginX = (width >> 1) + AnchorX`, `OriginY = (height >> 1) + AnchorY`; the earlier minus-sign version inverted the placement and made packed-gfx support points drift.
+- Grouped aligned export should currently apply only to `packed-gfx` frames, grouped by `TextureGroupIndex` + `TextureMode`; atlas frames stay only in the normal `frames/` export.
+- Grouped preview placement is axis-split: X uses engine-derived origin math, but Y uses the lowest visible opaque row in each exported frame because decoded `AnchorY` values are not yet sufficient to keep humanoid feet on a stable baseline across `texgrp-001`.
+- Auto-grouping also needs a short-form pivot split: when consecutive packed frames are both short, nearly the same height, and flip between top-attached and bottom-attached silhouettes, they should form separate grouped previews. This split fixed `E2L2` `texgrp-005` by separating `lookup 2370` from `2371..2377`.

@@ -1,0 +1,36 @@
+{
+  "servers": {
+    
+    "GhidrAssistMCP": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://127.0.0.1:8080/sse",
+        "--allow-http"
+      ]
+    },
+    "ghidra": {
+      "command": "python",
+      "args": [
+        "/Dev/Gaming/PC/Dos/Games/GhidraMCP-release-1-3/bridge_mcp_ghidra.py",
+        "--ghidra-server",
+        "http://127.0.0.1:8080/"
+      ]
+    },
+    "ghidra-mcp": {
+      "command": "python",
+      "args": [
+        "/Dev/Reverse Engineering/Apps/GhidraMCP/bridge_mcp_ghidra.py",
+      ]
+    },
+
+    "ghydra": {
+      "command": "python",
+      "args": ["/Dev/Reverse Engineering/Apps/GhydraMCP/bridge_mcp_hydra.py"],
+      "env": {
+        "GHIDRA_HYDRA_HOST": "localhost"
+      }
+    }
+  }
+}

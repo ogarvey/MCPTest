@@ -1,0 +1,122 @@
+- Arc The Lad EXE under Ghidra appears as `SLUS_012.24` on instance `8193`.
+- No `.IMG` / `.DAT` filename strings were found in a quick EXE string scan.
+- Better entry point for Arc graphics RE: start from TIM/GPU helper code (`timaddr=%08x` at `8011b330`) and walk upward to the first non-library caller that fills the source buffer.
+- Confirmed image-side runtime path: `FUN_8011d09c` composes sprite/tile grids and calls `FUN_8011d804`, which decodes 4-byte sprite entries into textured quads using `GetTPage` and `GetClut`.
+- `DAT_801aea7c` is the graphics resource root used by `FUN_801242e0` / `FUN_8011c768`, but the recovered code at `8011bfc8` is a bootstrap callback that seeds `DAT_801aea7c = 0x80118838`; it is not direct file I/O.
+- `FUN_8011fe98` populates many runtime resource buffers from `FUN_80175244(id)`.
+- `FUN_80175244` copies a `0x4c`-byte record from static table `DAT_8019fbe0` into scratch buffer `DAT_801ab988`, so that path is EXE-resident/static rather than external-file-backed.
+- The callback branch `FUN_8012c340 -> 80157f90 -> 80157fe4 -> 8012c47c/8012acec -> 8012adf8` is memory-card/status handling rooted at `BASLUS-01224ARC1-00*`, not the scene graphics loader.
+- `S1012.IMG` starts with a `pBAV` / `VABp`-style audio-bank header and is almost certainly audio, not graphics.
+- `S1011.IMG` looks like packed nibble-based image data; `S1011.DAT` / `S1012.DAT` share header words `0xC0000023` and `0x2020150C` and are the better external descriptor/index candidates.
+- Best current external graphics test pair: `S1011.DAT` + `S1011.IMG`.
+- The old `0x10000`-byte 8bpp split assumption was wrong: `FUN_8011d804` uses sprite-entry byte 2 high nibble as a `0x10`-step CLUT X addend before `GetClut(...)`, which is 4bpp-style palette selection.
+- `S1011.DAT` is a relocated RAM image with base `0x800CF000`; the working descriptor bank is at `DAT+0x4984C`, with a matching pointer array at `DAT+0x498EC`.
+- `S1011.IMG` is not four or six contiguous pages. It is a row-sliced atlas with per-row byte widths `0x80, 0x80, 0x100, 0x100`, which reconstructs two 4bpp pages and two 8bpp pages.
+- First strong on-disk sprite-entry candidates in `S1011.DAT` are at offsets `0x958`, `0x9D8`, `0xA58`, `0xAD8`, with rows like `(00,00,21,00), (20,00,21,00), (40,00,21,00), ...` matching the 4-byte runtime descriptor shape used by `FUN_8011d804`.
+- Sprite-entry byte 2 now reads as: low nibble = descriptor-table index, high nibble = palette slot.
+- `ArcTheLad/probe_arc_scene.py` now resolves the relocated descriptor bank, deinterleaves `S1011.IMG` by scanline, applies DAT CLUTs, and writes palette-backed page previews plus row sheets under `ArcTheLad/S1011_probe_mixed/`.
+- Preview export now uses RGBA PNG instead of BMP: texture / CLUT color `0x0000` becomes fully transparent and PSX bit15 is preserved as alpha `0x80` for semi-transparent texels.
+- Added-file validation families:
+	- Graphics-family pairs matching the current row-sliced atlas model: `S1011`, `S1023`, `S1031`, `S1072`.
+	- Audio/non-graphics pairs with `pBAV` / `VABp`-style `0x4F000` IMG payloads: `S1012`, `S1013`, `S1021`, `S1022`, `S1032`, `S1041`, `S1051`, `S1071`.
+	- `S1051` and `S1061` use a `3`-record bank at `DAT+0x4984C` with pointer array at `DAT+0x498C4`; the probe was updated to accept both `4`-record and `3`-record banks.
+	- `S1051` still resolves to audio: its `3`-record bank totals only `0x20000`, while the paired `IMG` is a `pBAV` / `VABp` `0x4F000` payload.
+	- `S1061` is a non-`VABp` `0x30000` outlier whose recovered `3`-record bank totals `0x28000` (`8bpp, 8bpp, 4bpp`), leaving one unexplained `0x8000` tail; partial decode was written to `ArcTheLad/S1061_probe_partial/`.
+	- Ghidra-backed correction: the `0x28` records at `DAT+0x4984C` are texture descriptors referenced through the root object at relocated address `0x80118838`, not the final compositor banks.
+	- Root layout from code:
+		- `root + 0x00` -> texture-descriptor pointer array
+		- `root + 0x04` -> bank-descriptor pointer array
+		- `root + 0x08` -> active bank index
+		- `root + 0x0C` -> script/config tables for `FUN_801208bc`
+	- Bank descriptors drive final composition:
+		- `bank + 0x04` -> size/meta block; bytes `+4/+5` = map width/height, bytes `+6/+7` = tile width/height, and `+8` onward is the 16-bit tile map.
+		- `bank + 0x08` -> 4-byte sprite-entry table.
+		- `bank + 0x10` -> texture-descriptor pointer array used by `FUN_8011d804`.
+		- `bank + 0x18` -> optional 12-byte live tile-index remap script `{target, sequence_ptr, current_step, current_counter}`; null for `S1011` and `S1061`, so the tile-ID remap defaults to identity.
+		- Extractor correction: sprite-entry byte `2` low nibble must resolve through the bank-local `bank + 0x10` array, not a global descriptor index shortcut.
+		- `probe_arc_scene.py` now uses that bank-local pointer chain and no longer rejects a bank just because its `bank + 0x10` array differs from the root texture array.
+		- `FUN_8011cfc4` applies the current remap entry as `sequence[current_step + 1]` and then mutates the in-record step/counter for later frames; the probe now uses the DAT-side current step as the offline first-frame remap state and was revalidated on `21/S2021`.
+		- `FUN_8011d09c` uses `(flags & 0x0C) == 0x08` as an occupancy-marker rule when bank flag `0x04` is clear; it is not a texel-zero opacity override. The probe now applies that occupancy rule in the main bank render path and was revalidated on `1/S1023`.
+		- Current remaining gap is cleaner per-piece grouping plus optional multi-frame remap stepping for animated tiles.
+	- `S1061` wrong-output diagnosis: the probe was composing from guessed “regular row” patterns instead of the active bank's real tile map and sprite table. Active bank `0` uses `size_ptr=DAT+0x290`, `sprite_ptr=DAT+0x3D8`, `tex_array=DAT+0x498C4`, and a `10x8` map of `32x32` tiles. Sprite-entry flags include `0x08`, so heuristics that required `flags < 8` were invalid.
+	- Probe update: active-bank composition is now implemented in `ArcTheLad/probe_arc_scene.py`. `S1061_probe_mixed/scene/active_bank_00_320x256.png` looks plausibly correct and is built from the active bank tile map plus sprite table, not from heuristic row runs.
+	- `S1061` active bank uses only descriptors `0` and `1` (both `8bpp`), so the ignored `0x8000` tail and unused `4bpp` descriptor are outside the active scene path.
+	- Full validation after active-bank compositor:
+		- Scene outputs now generated for `S1011`, `S1023`, `S1031`, `S1061`, `S1072`.
+		- `S1011` and `S1031` look clearly coherent.
+		- `S1061` is scene-like and much improved but still has a clipped / missing upper-left region.
+		- `S1072` is scene-like but still has unresolved gray masked shapes near the top.
+		- `S1023` now looks like a sparse prop/object layer rather than scrambled garbage; likely needs extra layer/bank/script handling.
+	- Probe update: `probe_arc_scene.py` now has a diagnostic multi-bank compositor that writes `all_banks_desc_*` and `all_banks_asc_*` scene PNGs when multiple banks are present.
+	- Important renderer fix: transparent texels no longer overwrite existing pixels during layered composition; alpha is now composited instead of blindly replaced.
+	- Current multi-bank findings:
+		- `S1023` becomes a coherent room only when banks are combined in ascending bank index order.
+		- `S1072` becomes much more plausible in ascending bank order; bank `1` is a real cloud/gate overlay, not random corruption.
+		- `S1061` does not improve by simply combining all banks; the remaining defect is not just a missing bank layer.
+	- Reverted experiment: treating indexed texel value `0` as visible via `CLUT[0]` was not the right direction for `S1023`. Current probe behavior keeps indexed `0` transparent for 4bpp/8bpp pages.
+	- `FUN_8011d09c` renders a scrolled `320x240` viewport over the bank tile map, not the whole map as a final scene image. Bank descriptor fields at `+0x1C/+0x1E` are initial scroll values.
+	- Probe update: `probe_arc_scene.py` now emits `runtime_bank_*_320x240.png` and `runtime_all_banks_*_320x240.png` diagnostic renders based on the runtime viewport model.
+	- `S1023` follow-up:
+		- Root script tables are empty, so the scene is not controlled by `root + 0x0C` scripts.
+		- All banks use scroll `(0,224)`; bank `3` has depth-mode field `+0x20 == 1`.
+		- Bank `0` should not currently be treated as suppressed/disabled.
+		- The previously missing sprite-flag `0x08` occupancy path from `FUN_8011d09c` is now implemented in the main probe renderer and was revalidated on `1/S1023`.
+	- Full data drop note: the Arc directory now has `240` DATs vs `189` IMGs. `E1`-`E5` each have one shared `IMG` for ten `DAT`s, and those shared images are `VABp`-style audio payloads.
+	- Probe now writes `_blackbase` variants for scene outputs by compositing the rendered RGBA scene over opaque black; useful for checking whether visible holes are just alpha over no background.
+	- Current exporter behavior: `scene/` now keeps only one final image per renderable pair, `all_banks_asc_*_blackbase.png`; older diagnostic scene variants are no longer emitted by default.
+	- Current CLI cleanup: default runs now keep only visual outputs (`pages/`, `sprites/`, `scene/`) and suppress `probe_report.txt`, `raw/`, and `debug/` unless `--write-report`, `--write-raw`, or `--write-debug` are passed.
+	- Across the current graphics-family sample set, only `S1023` uses a 4bpp palette with both nonzero `CLUT[0]` and zero-index texels in active scene content, localized to bank `0` descriptor `3` palette slots `10` and `13`.
+	- Wider same-stem sweep outside `ArcTheLad/1`: `170` pairs processed, `9` rendered-scene hits. Current positive directories are `21` (`S2033`), `22` (`S2051`, `S2053`, `S205C`), `4` (`S4031`), `D` (`SD013`, `SD014`), and `F` (`SF051`, `SF0B1`).
+	- Folder `22` remains a pairing counterexample, but the current safe interpretation is narrower: `S2051.IMG`, `S2053.IMG`, and `S205C.IMG` are the proven same-folder graphics IMGs, while `S2052.IMG` is a leading-`pBAV` container and is no longer treated as a proven same-stem scene source.
+	- Low scene counts outside folder `1` are therefore partly a pairing-discovery problem, not just a decode problem.
+	- Current same-stem negative directories under the existing probe: `23`, `31`, `32`, `5`, `6`, `7`, `8`, `9`, `B`, `C1`, `C2`.
+	- `E1`-`E5` remain special-case directories with shared `SE0x.IMG` files rather than one IMG per DAT; do not include them in same-stem batch sweeps.
+	- Current output gap: the probe exports final scene composites plus descriptor page previews, but not dedicated sprite-entry sheets across the full data set.
+	- `pBAV` / `VABp` in Arc IMG files is a leading audio container, but the scene-family files also append a full trailing graphics block. `FUN_80128aa8(headPtr, bodyPtr, vabId)` confirms the VAB library itself expects the caller to hand it separate header/body pointers.
+	- Undefined caller stubs decoded enough to recover the wrapper behavior: `0x80129EC0` opens `FUN_80128AA8(0x800C4000, 0x800C9000, 0)`, while `0x8012A1C4` opens `FUN_80128AA8(0x800C9000, 0x800CF000, 1)` unless `FUN_80129FD0` says the current scene id is in the hardcoded skip list at `DAT_8019416C`.
+	- The small callback stack at `DAT_801AA3EC` is now named in Ghidra: `ResetLoadCallbackStack`, `SetCurrentLoadCallback`, `PushLoadCallback`, `PopLoadCallback`, and `RunCurrentLoadCallback`.
+	- Corrected scene-family split rule: use the full trailing `0x30000` graphics block, not the trimmed descriptor-byte tail. For `22/S2052.IMG`, `IMG[0x1F000:]` is byte-identical to the plain graphics IMGs `S2051.IMG`, `S2053.IMG`, and `S205C.IMG`.
+	- Validated same-stem `pBAV` pairs now include `SD011`, `SD012`, `SD015`, `S2052`, and the former folder `1` “audio” cases `S1012`, `S1013`, `S1021`, `S1022`, `S1032`, `S1041`, `S1051`, `S1071`.
+	- After the pBAV trailer fix, same-stem page decoding succeeds for `137` Arc DAT/IMG pairs outside `E1`-`E5`; folder `22` now decodes all `S2051`-`S205C` same-stem pairs except `S2046` / `S2047`, and folder `D` decodes `SD011`, `SD012`, `SD013`, `SD014`, `SD015`, `SD021`, `SD031`, `SD041`, `SD071`.
+	- `probe_arc_scene.py` now emits per-bank contact sheets under each pair's `sprites/` directory, but these are scene-bank quads from `FUN_8011d09c -> FUN_8011d804`, not confirmed character / actor sprites.
+	- Separate textured-sprite subsystem identified in Ghidra: `FUN_801693d4` dispatches to `FUN_80169414` / `FUN_801698f4`, but the currently reached objects (`DAT_8019b2e0`, `DAT_8019b33c`, `DAT_8019b398`, `DAT_8019b3f4`) point at built-in data like `0x8019b0b0`, `0x8019b16c`, `0x801b4008`, and `0x801b9968`, so this branch now looks like static UI / overlay art rather than the external scene actor loader.
+	- Another nearby false lead: `FUN_8011dc70 -> FUN_8011e078 -> FUN_8011e7c0 -> FUN_8011ea88` uses fixed UVs from `DAT_80192940` plus constant `GetTPage(0,0,0x140,0)` / `GetClut(0x20,0x1e0)`, so it also looks like a built-in effect / overlay path, not character-sprite asset loading.
+	- Current correction on the scene-indexed staging helpers: `0x8012A040` and `0x8012A240` are best modeled as reading different fields from one `12`-byte scene record table rooted at `0x80193384`, not as separate independent tables. `0x8012A040` reads `record.word0`; `0x8012A240` reads `record.word1` via the `0x80193388` field offset.
+	- The raw scene records look like `[small id, small id, KSEG0 pointer]`, e.g. `(0x4C2, 0x42D, 0x801304D0)` and `(0x5F6, 0x561, 0x8015875C)`, so the third word is most likely a shared handler / descriptor pointer rather than another file key.
+	- Highest-priority graphics staging branch is now `0x8012A240`: it uses `record.word1`, caches it, stages to `0x800CF000` with size/budget `0x4A800`, then pushes callback `0x8013A380`.
+	- Same-stem `pBAV` scene-family pairs are no longer withheld when the full trailing graphics block is present: `probe_arc_scene.py` now selects that block and emits normal `pages/`, `scene/`, and scene-bank `sprites/` outputs. `22/S2052_probe_mixed` is the reference case.
+	- Current lone exporter outlier among proven same-stem graphics pairs is `D/SD041`: descriptor pages decode and page previews are written, but no graphics root matches yet, so there is still no `scene/` or `sprites/` output for that pair.
+	- New parser anchor beyond the scene-bank compositor: `FUN_8015b458` is a 16-bit command interpreter over `DAT_801b23d0`, using `FUN_8015dec4` as its signed-word reader.
+	- Recovered `FUN_8015b458` sibling branches now split cleanly:
+		- `FUN_8015c754 -> FUN_8016c520` = UI/text/layout byte stream.
+		- `FUN_8015ca98` = global transform-state update (`[selector, value]` into rotation/translation triples), not an asset record.
+		- `FUN_8015cbdc` = reset/init opcode with no extra fields.
+		- `FUN_8015cc44 -> FUN_8015acf0` = deferred runtime packet loader plus wait/delay/controller dispatch, still runtime-side rather than asset-side.
+	- First useful non-UI content record under `FUN_8015b458`: `FUN_8015bda8`.
+		- It consumes 6 signed 16-bit words and spawns/configures a live object.
+		- Recovered layout: `{ slotIndex, resourceId, coordA, coordB, variant, initParam }`.
+		- `slotIndex` selects `DAT_801afee0 + slot*0x4c` and stores the spawned object pointer at `slot+0x44`.
+		- `resourceId` goes through `FUN_80133974(0, resourceId)` and is the best current resource/sprite/model reference field.
+		- `coordA` / `coordB` become object placement fields at `object+0x14` / `object+0x18` after scene-origin adjustment.
+		- `variant` is mirrored into `slot+0x02` and `object+0x9d`; `slot+0x04` and `slot+0x06` are forced to `0x0200`.
+		- `initialStateSelector` is passed to `FUN_80140994(object, selector)`, which stores it at `object+0x4a` and seeds the object's first local queue entry as `{ selector, -1, -1 }` across `object+0x74/+0x76/+0x78` via `FUN_80140928 -> FUN_801408d4`.
+		- Runtime callback installed by this command: `object+0x08 = 0x8015bcf4`.
+	- Best next semantic sink after `FUN_8015bda8` is the first consumer of the object-local queue rooted at `object+0x74`; `FUN_801408d4` is the nearest queue writer helper.
+		- `resourceId` now resolves through EXE pointer table `DAT_800D4044`; prefer extractor label `graphicResourceId` / `spriteResourceId`.
+		- File-backed command VM anchor for extractor work: `RAM 0x801187FC` / `DAT+0x497FC` resolves to `0x80116800` / `DAT+0x47800` in validated scene-family DATs.
+		- This pointer is the base of the `DAT_801B23D0` command-word array, not the guaranteed first executed command.
+		- Real command fetch is `DAT_801B23D0 + DAT_801FF310*2`; initial cursor comes from a copied `0x22`-byte state record selected via `FUN_80158C64 -> FUN_80158E90`.
+		- Resulting extractor rule: report the command-word base and preview words now, but do not do a naive linear offline walk from word `0` yet.
+		- `probe_arc_scene.py` now includes this `Scene command VM anchors` section in `probe_report.txt`, validated on `1/S1011` and `22/S2052`.
+		- Startup-selection boundary: `FUN_801589D8` builds startup candidates before selection; `FUN_8015B458` is only post-selection via `FUN_80158E90`.
+		- `FUN_80158AA4` is a zero-argument wrapper around `FUN_80158B08(pointer,index)`: fixed EXE-backed sources come from `0x801AEA8C` and `0x801AEAD0..DC`, with 5 total entries.
+		- `FUN_80158B08` writes `0x4C`-stride startup-source records at `0x801FF020 + index*0x4C` and fixes `+0x00=3`, `+0x04=0`, `+0x06=0`, `+0x44=sourcePtr`.
+		- `FUN_80158B40` is a zero-argument wrapper around `FUN_80158BE8(nodePtr,runningIndex,bankFlag)`: it flattens runtime lists from `0x801AFE70` (flag 0) then `0x801B2048` (flag 1) into `0x801AFEE0 + index*0x4C`.
+		- `FUN_80158BE8` fixes `+0x00=0x2B`, `+0x04=0x0200`, `+0x06=0x0200`, `+0x44=nodePtr`, `+0x48=bankFlag`.
+		- Offline consequence: `FUN_80158AA4` can be modeled immediately from EXE data; `FUN_80158B40` still depends on upstream runtime-list builders and should not yet be treated as file-backed.
+		- `FUN_80158C64` primary rule: first `0x22`-byte slot in `0x801AE6C8` with `u16(+0x02) & 1`; secondary fallback uses `0x801AFF00` gated by bit `0x10` in `0x801AFEE0` records with stride `0x4C`.
+		- In validated scene-family DATs those startup banks lie outside the relocated DAT image, so cold-start record selection is currently runtime-built, not file-backed.
+		- `DAT_801FF330` is a separate cursor-seed global written by `0x2B` / `0x3C`; do not treat it as `record+0x20`.
+		- `probe_arc_scene.py` now includes a `Startup state selection` report section that exposes the recovered rule without guessing a startup record from DAT data alone.
+		- Page extraction and page preview are now separate concerns in `probe_arc_scene.py`: parsed descriptor assets are written by default under `assets/` as `.bin`, `.clut.bin`, and `.json`, even if final rendered previews remain ambiguous.
+		- 4bpp page previews no longer rely on a single `1024x1024` contact sheet; default outputs emit true-size per-slot PNGs like `desc_00_slot_0F_256x256_4bpp.png`, which fixed the misleading `S3041` output shape.

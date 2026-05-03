@@ -1,0 +1,8 @@
+Step 1.
+UAE Offset for 0x23DC42 = 0x97B5A
+A0 = 0x126AC
+A1 = 0x12674
+SP = 0x3377A
+SP + 8 = 0x33782
+
+Step 2.

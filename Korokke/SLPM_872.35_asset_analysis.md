@@ -1,0 +1,316 @@
+# SLPM_872.35 Asset Pipeline Analysis
+
+## Scope
+
+- Target formats: `.ANC`, `.ANM`, `.ANN`
+- Primary focus: identify file loading, parsing, and decode/decompression routines
+- Starting point: `FUN_80036990`
+
+## Session Log
+
+### 2026-04-18
+
+- Established Ghidra connection to `SLPM_872.35` on port `8192`.
+- Analysis starting from `FUN_80036990`.
+- Confirmed `FUN_80036990` is not a low-level decompressor. It is a battle-scene bootstrap that loads `.TIM`, `.ANC`, `.ANN`, `.ANM`, and `.SEQ` assets, then initializes combatant state and battle UI globals.
+- Identified the format-specific helper families used by the bootstrap:
+	- `.ANC`: `FUN_8001c508` -> `FUN_8001a480` -> `FUN_8001a55c`
+	- `.ANN`: `FUN_8001c508` -> `FUN_8001aa84` -> `FUN_8001a3a4`
+	- `.ANM`: `FUN_8001c508` -> `FUN_8001a030` -> `FUN_8001a170`
+
+## Current Findings
+
+- `FUN_80036990` performs these major tasks in order:
+	- Clears and rewinds resource/animation bookkeeping state.
+	- Loads UI/background textures such as `BPARTS.TIM`, `FUSEN.TIM`, `BFACxx?.TIM`, and map textures such as `MAP0?.MP` / `MAP1?.MP`.
+	- Chooses battle background music / battle presentation based on `DAT_800c51ee`, `DAT_800c6654`, and related mode globals.
+	- Loads fighter animation packs from `.ANC` files such as `FCHARA00.ANC`, `BCHARAxx.ANC`, `ICHARAxx.ANC`.
+	- Loads effect / gimmick resources from `.ANN` files such as `GIMICK.ANN`, `EFFECT.ANN`, and in some modes `BPART2.ANN`.
+	- Loads part animation resources from `.ANM` files such as `BPART3.ANM`, `BPART4.ANM`.
+	- Builds and clears combatant slots rooted at `DAT_800c2cc0`, sets per-combatant placement/state fields, and initializes battle HUD / timer related globals.
+- The function is called as a shared setup step immediately before `FUN_8003a190`, which appears to be the main battle execution loop.
+- Direct callers currently observed:
+	- `FUN_80035844`: forces `DAT_800c51ee = 1` and calls the setup with stage `4`.
+	- `FUN_800368dc`: forces `DAT_800c51ee = 4` and calls the setup with stage `0x1c`.
+	- `FUN_8002f694`: sets up a selected-versus-target fight using the current roster.
+	- `FUN_8002fe18`: prints `ivent battle` debug text and sets up an event battle variant.
+	- `FUN_8001f968`: the larger top-level mode loop calls it for normal and tournament-like battle flows.
+- The low-level file loader is `FUN_8001c508`. It prints `loading [%s]`, records the resource slot pointer, loads from the filesystem or from `BIND.DAT`, and advances the aligned heap tail.
+- `FUN_8001d6f8` rewinds the heap tail to the start of a loaded slot and marks that slot unused.
+- `FUN_8001d73c` trims the heap tail to the actual used byte count for a slot after the format-specific upload step completes.
+- `.ANC` path:
+	- `FUN_8001a480` registers ANC-backed entries in the shared asset registry and points each entry at the data block after the file header-sized prefix.
+	- `FUN_8001a55c` uploads ANC texture data to VRAM and returns the byte count consumed from the file.
+- `.ANN` path:
+	- `FUN_8001aa84` registers ANN-backed entries in the same registry with type `1`.
+	- `FUN_8001a3a4` uploads ANN texture data to VRAM and returns the header-offset size used for heap trimming.
+- `.ANM` path:
+	- `FUN_8001a030` registers page descriptors from the ANM header and precomputes VRAM / CLUT placement metadata.
+	- `FUN_8001a170` uploads the referenced ANM pages into VRAM and returns the header size.
+
+### Asset Runtime And Render Path
+
+- The shared asset runtime is built around a 0x94-byte per-entry struct rooted at `DAT_8008d298`. The loader/register functions only populate this table; actual image composition happens later.
+- `DrawActiveAssetEntries` is the high-level render wrapper used by generic menu / effect scenes. It surrounds `RenderAssetEntries` with engine-specific pre/post draw setup.
+- `RenderAssetEntries` is the main draw walker for all active ANC / ANN / ANM entries:
+	- It scans all 1100 asset-entry slots from back to front.
+	- It skips disabled entries, hidden entries, and entries with frame id `0xffff`.
+	- It resolves the current frame descriptor from `assetBase + 0x4c0 + frameIndex * 10`.
+	- It combines script-updated position, scale, rotation, priority, tint, and flip state with the frame data, then dispatches to the correct primitive builder.
+- The slot type byte at entry offset `+0x7f` is assigned by the register helpers and directly selects the render path:
+	- `0`: `.ANM` entry, registered by `RegisterAnmSlotRange`
+	- `1`: `.ANN` entry, registered by `RegisterAnnSlotRange`
+	- `2`: `.ANC` entry, registered by `RegisterAncSlotRange`
+- `.ANM` and `.ANN` entries both use the single-quad path through `QueueSpriteQuad`.
+	- This function allocates one PSX textured quad primitive and fills in UVs, screen coordinates, tint, semi-transparency bits, tpage, and clut.
+	- Rotation, scaling, and horizontal / vertical flip are all applied here.
+	- `FUN_80018434` is a thin convenience wrapper for the same primitive path through `FUN_80015a68`.
+	- Its effective argument layout is `(textureMode, x, y, width, height, tpageBase, u, v, clutX, clutY, otBucket)`.
+	- The final CLUT primitive field is packed exactly like PSX GPU `GetClut(x,y)`: `(clutX >> 4) + clutY * 0x40`.
+	- The wrapper hardcodes `scaleX = scaleY = 0x1000`, `flags = 0`, `rotation = 0`, and neutral vertex color `(0x80, 0x80, 0x80)`.
+	- Practical consequence: when callers pass `..., 0x140, 0x1FF, 300`, that `0x1FF` is the CLUT Y row for the direct quad draw, not a separate resource id or mode value. The final `300` is the ordering-table bucket.
+	- `.ANN` adds one extra remap step in `RenderAssetEntries` before the quad is queued: it derives adjusted tpage / clut values from the high byte of the frame descriptor's fifth word and from the entry's resource-page nibble. This looks like ANN-specific texture-bank selection rather than decompression.
+- `.ANC` entries use tiled composition rather than a single quad.
+	- `RegisterAncSlotRange` stores an extra pointer at entry offset `+0x80` to `ancData + *(u32 *)ancData`.
+	- That ANC sub-structure begins with a tile-grid width in the first two bytes and a 3-byte-per-cell composition table at `+0x10`.
+	- `QueueAncTileGrid` renders the composed sprite as an axis-aligned grid of 8x8 textured quads.
+	- `QueueRotatedAncTileGrid` renders the same ANC composition through a rotated / warped 8x8 grid.
+- Practical implication: the current evidence points away from a separate general-purpose decompressor for these formats. The export path is most likely:
+	- load raw texture pages into VRAM-equivalent memory,
+	- step the asset script to obtain the active frame and transforms,
+	- read the per-frame descriptor table,
+	- then assemble the final sprite from either one textured quad (`.ANM` / `.ANN`) or an 8x8 tile grid (`.ANC`).
+- Special render cases observed in `RenderAssetEntries`:
+	- Frame id `999` is treated as a fullscreen color overlay / fade rectangle.
+	- Frame ids with bit `0x4000` set draw a solid colored rectangle instead of textured sprite data.
+- `StepAssetEntryScript` is the per-entry command interpreter that prepares the state consumed by `RenderAssetEntries`.
+	- It updates the current frame id, delays, transforms, tint deltas, and flip / mode state in the shared entry table.
+	- `UpdateActiveAssetEntries` is the per-frame bulk updater that steps all enabled entries through this interpreter.
+
+### Palette / CLUT Findings
+
+- Archive dump naming caveat:
+	- The `BIND_output` filenames derived from the `.TBL` are not fully normalized.
+	- Entries ending in `IM` are real `.TIM` files, and entries ending in `NN` are real `.ANN` files.
+	- Examples confirmed on disk: `BPARTS  IM` -> `BPARTS.TIM`, `FFACE   IM` -> `FFACE.TIM`, `EFFECT  NN` -> `EFFECT.ANN`, `GIMICK  NN` -> `GIMICK.ANN`.
+- Verified TIM structure for the `IM` files:
+	- The battle companion `IM` files are valid TIMs with header magic `0x10` and flags `0x8` or `0x9`.
+	- `BPARTS.TIM`, `FFACE.TIM`, and the `BFACE???.TIM` / `BFACE???R.TIM` files each carry a single 256-color CLUT row plus 4bpp texture data.
+	- Practical consequence: the important palette information for ANN / ANC recovery is the scene's `LoadTimToVram` destination row, not the source TIM header's baked CLUT coordinates.
+- `.ANM` files carry their palette data inside the same uploaded page blocks.
+	- `UploadAnmPagesToVram` uploads a `0x100 x 1` palette row from the front of each page block before uploading the actual texture page.
+	- `RegisterAnmSlotRange` seeds explicit per-page CLUT X/Y bases in the asset-entry tables, and those exact values are consumed later by `QueueSpriteQuad`.
+	- Page type semantics are now tighter:
+		- type `0`: 4bpp `256x256`
+		- type `1`: 8bpp `256x256`
+		- type `3`: runtime-special `128x256` page that is uploaded with `0x40 x 0x100` image geometry and then coerced from page mode `3` to `QueueSpriteQuad` texture mode `1` in `RenderAssetEntries`
+	- Practical consequence: treating ANM type `3` as 4bpp `256x256` is wrong even though its payload size matches a 4bpp page. It behaves like an 8bpp `128x256` page with an embedded 256-color palette row, and correcting that materially changes `CUT00` / `BPART4` exports.
+	- Practical consequence: ANM extraction can recover real colors from the file alone.
+- `.ANN` and `.ANC` handle palette state differently.
+	- `UploadAnnTextureData` uploads only the texture page at `textureOffset + 8`, so `.ANN` still depends on externally staged CLUT rows.
+	- `RegisterAnnSlotRange` only seeds the asset-entry registry with an ANN resource-page byte; it does not upload or resolve any palette data itself.
+	- `FUN_80029a1c` does not currently provide an alternate ANN path for ADV / MES scenes.
+		- Its dynamic basename builders only append `.MP` in opcode `6`, `.TIM` in opcodes `0x3C` and `0x50`, and `.MES` in opcode `100`.
+		- The opcode `6` map branch also calls `LoadPackageAndMpk`, reinforcing the package-driven path for ADV scenes.
+		- Practical consequence: the earlier suspicion that `F00.ANN` might be reached through the MES interpreter is now much weaker. The traced interpreter path stays in map / package / TIM / MES territory.
+	- Focused `F00.ANN` file-layout inspection tightened that model but did not fully prove it yet:
+		- `F00.ANN` has `textureOffset = 0x920`, so the region `0x4C0..0x91F` is all pre-texture payload.
+		- The strongest extractor-ranked candidate windows for a hypothetical internal CLUT fall around `0x640..0x720`, and they do not overlap the 15 actually used frame descriptors from the discovered scripts.
+		- However, a direct raw-word check on the strongest exported candidate block (`0x700..0x8FF`) showed every 16-bit value is `<= 0x00FF`.
+		- Practical consequence: that pre-texture region is still structurally interesting, but its strongest candidate block does not currently look like a normal 15-bit PSX CLUT row. It is more consistent with low-byte metadata / unused descriptor-region content than with an ANC-style hidden embedded palette.
+	- `RenderAssetEntries` later reconstructs the effective ANN texture/CLUT bank from two things:
+		- the per-entry `resourceId` byte written by `RegisterAnnSlotRange`
+		- the high byte of frame descriptor word 4
+	- Practical consequence: ANN palette recovery has to follow the scene's earlier TIM uploads and the runtime bank-mapping formula, not just the `.ANN` file contents.
+	- `UploadAncTextureData` uploads only the ANC texture atlas after the tile-composition table, but that full `LoadImage` rectangle becomes the same VRAM bank later sampled by `QueueAncTileGrid` for CLUT lookup.
+	- Practical consequence: `.ANC` does not have a separate CLUT upload step, yet its file-local atlas words can still provide the effective 16-color subpalettes because `QueueAncTileGrid` reads CLUTs from the bottom rows of that uploaded atlas bank.
+- Battle setup confirms the external-palette model for ANC / ANN.
+	- `SetupBattleScene` loads several TIM resources before registering ANC / ANN assets: `BPARTS.TIM`, `BFAC??E.TIM`, `BFAC??R.TIM`, optional `FUSEN.TIM`, and in some modes `FFACE.TIM`.
+	- Those TIM uploads explicitly load CLUT rows at Y positions `0x1EA` through `0x1EF`.
+	- Concrete ANN registrations in `SetupBattleScene`:
+		- `GIMICK.ANN` -> `resourceId 0x0C` or `0x0F` depending on branch
+		- `BPART2.ANN` -> `resourceId 0x1F`
+		- `EFFECT.ANN` -> `resourceId 0x1D`
+	- Static call-xref sweep of `RegisterAnnSlotRange` / `UploadAnnTextureData` in `SLPM_872.35` found only two direct ANN registration sites in the executable:
+		- `SetupBattleScene`
+		- `FUN_8003be70` (continue screen)
+	- Practical consequence: if assets like `F00.ANN` are used by this title, they are not being registered through any additional literal ANN call site in the main executable. They are likely reached through a higher-level package/script path, dynamically named data, or another module.
+	- High-confidence consequence: `BPART2.ANN` / `EFFECT.ANN` are definitely intended to sample battle-side CLUT banks staged by those earlier TIM uploads rather than by any data inside the `.ANN` itself.
+	- Separately verified UI / result-scene loaders reinforce the same pattern: `FFACE.TIM` is uploaded with CLUT Y `0x1EF`, `BPARTS.TIM` with CLUT Y `0x1EA`, `IV_MESW.TIM` with CLUT Y `0x1E1`, and result-background TIMs with CLUT Y `0x1ED`.
+	- Continue-mode loader `FUN_8003be70` gives another concrete ANN example outside battle: it calls `CreateBlankTimResource`, uploads that synthetic TIM with `LoadTimToVram(..., clutY=0x1ED)`, and only then loads / registers / uploads `CONTINUE.ANN`.
+	- High-confidence interpretation: `CONTINUE.ANN` also depends on scene-prepared external palette state; the `.ANN` file itself is only the indexed texture payload.
+	- A literal-string sweep for `.ANN` names in `SLPM_872.35` found only four named ANN assets:
+		- `GIMICK.ANN`
+		- `BPART2.ANN`
+		- `EFFECT.ANN`
+		- `CONTINUE.ANN`
+	- Xrefs for those literals confirm the currently traced ownership split:
+		- `SetupBattleScene` owns `GIMICK.ANN`, `BPART2.ANN`, and `EFFECT.ANN`.
+		- `FUN_8003be70` owns `CONTINUE.ANN`.
+	- Practical consequence: in the current executable, literal ANN usage is battle/result/UI-side, not ADV/MES-side.
+	- After that, the battle ANC / ANN resources are registered with small resource-page ids such as `0x15`, `0x17`, `0x19`, `0x1B`, `0x1D`, and `0x1F`, which the draw helpers use to derive tpage/clut values at render time.
+		- `SetupBattleScene` now has concrete ANC mappings: player `BCHARAxx.ANC` registers at start slot `300` with count `0x19` and `resourceId 0x15`; the opponent `BCHARAxx.ANC` / `ICHARAxx.ANC` registers at start slot `0x145` with count `0x19` and `resourceId 0x19`.
+		- The special `FCHARA` follow-on ANC packs use the same mechanism with `resourceId` values `0x17`, `0x19`, and `0x1B`; related battle-side support assets continue with `0x1D` for `EFFECT.ANN` and `0x1F` for `BPART2.ANN` / `BPART*.ANM`.
+	- High-confidence interpretation: the battle ANC / ANN files depend on palette banks staged by those earlier TIM uploads rather than carrying their own palettes.
+	- Live decompile now pins down the ANC routing formula precisely:
+		- `RegisterAncSlotRange` copies the `resourceId` into the per-entry palette-page byte table used later by the renderer.
+		- `UploadAncTextureData` uploads ANC atlas pixels to `x = ((resourceId & 0xF) << 6)`, `y = ((resourceId >> 4) << 8)`.
+		- `QueueAncTileGrid` derives the CLUT address from the same `resourceId` plus the tile attribute byte:
+			- `clutX = ((resourceId & 0xF) << 6) + (attribute < 0x20 ? ((attribute & 3) << 4) : ((((attribute - 0x20) & 3) << 4) + 0x40))`
+			- `clutY = ((resourceId >> 4) << 8) + 0xFF - (attribute >> 2)`
+		- This means the common battle path `clutX = 0x140`, `clutY = 0x1FF` for `resourceId 0x15` is simply the bottom row of that ANC upload bank, not evidence of a missing copied TIM row.
+		- `RenderAssetEntries` does not pull that base byte from script state. It indexes the per-entry lookup tables rooted at `DAT_8008d2a0`, `DAT_8008d2ac`, `DAT_8008d2b8`, and `DAT_8008d2d0` with `(byte)frameDescriptor[4]` / `PageSlot`.
+		- `StepAssetEntryScript` advances frame ids, delays, flip state, tint/effect bytes, scaling, rotation, and offsets, but it does not overwrite those `PageSlot` lookup tables after registration.
+		- Practical consequence: ANC tiles are 4bpp and the attribute byte is a scene-driven 16-color subpalette selector, not a simple linear palette index.
+		- When emulating this from raw TIM CLUT data, runtime row `0` corresponds to the bottom row of the staged CLUT bank because the game counts rows downward from `0x1FF`.
+		- Follow-up tracing on battle row `0x1FF` narrowed the remaining palette problem substantially.
+			- Exhaustive `LoadTimToVram` xref review found no `SetupBattleScene`-side upload to row `0x1FF`; the battle bootstrap's explicit TIM loads still stop at `0x1EA` through `0x1EF`.
+			- `UploadAncTextureData` and `UploadAnnTextureData` only upload texture pixels, not CLUT rows, so they do not explain the top-row palettes used by battle ANC tiles.
+			- `UploadAnmPagesToVram` does upload palette rows, but only on the ANM page row `((pageByte >> 4) << 8)`, not on the ANC runtime row formula ending in `0xFF`.
+			- Known explicit `0x1FF` TIM uploads currently come from UI/bootstrap paths such as `FUN_8001f968`, `FUN_8002ddec`, `FUN_8002f694`, `FUN_8002fe18`, and `FUN_80036300`, and those identified cases load `FONT88A.TIM` rather than a battle-character palette TIM.
+			- `FUN_80020e24` proves resource ids `0x15`, `0x17`, and `0x19` can be rendered against CLUT row `0x1FF` even when that function only loads `VS??.TIM` rows `0x1E0` and `0x1E1`, which shows those resource ids can rely on inherited top-row VRAM state rather than a local scene-specific `0x1FF` upload.
+			- High-confidence implication: the missing battle subpalettes on row `0x1FF` are likely inherited from broader scene history or another data-driven/scripted setup path outside `SetupBattleScene`, not from a direct battle-only TIM association in the bootstrap itself.
+			- Related dead end: the script-driven face/pic loader path through `FUN_8003648c` / `FUN_8003657c` is configured by `FUN_8002e174` for rows `0x1E3` and `0x1E4`, not `0x1FF`.
+			- Follow-up on the pre-battle external script path tightened that conclusion further.
+				- The extracted `BIND_output\*.ES` files are the ADV `.MES` scene scripts: raw ASCII extraction shows `dNAME` tokens, and opcode `100` in `FUN_80029a1c` appends `.MES` and loads that next scene.
+				- Observed story-chain edges from the extracted data include `START -> QUA1ST -> QUA1MAP -> QUA2ND -> QUAEND -> BAT1ST -> BAT1MAP`, then chapter-1 battle-map branches through `BAT1FOR`, `BAT1RUI`, and `BAT1ROK`; later chapters continue through `END1ST -> BAT2ND -> BAT2MAP -> BAT3RD -> END3RD -> BAT4TH -> IVE4TH -> BAT5TH -> BATBL -> END5TH/METAMO -> BATPO/ENDING`.
+				- The same scripts use two generic TIM-loader opcodes exposed directly in ASCII: `PNAME` maps to case `0x50` and `FUN_8003657c`, while `<slot,variant,NAME` maps to case `0x3C` and `FUN_8003648c`.
+				- `FUN_8003657c` always uploads its TIM to row `0x1E0`. `FUN_8003648c` uses a tiny face-slot table initialized by `FUN_8002e174`, and that initializer only seeds rows `0x1E3` and `0x1E4` for the script-driven portrait path.
+				- A corpus-wide pass over the extracted `*.ES` scripts found many references to `PIV_BG_*`, `BUL_*`, and `BUR_*` TIM families, but no script-side references to `ALL`, `ALL.TIM`, or `FCRA_ALL`.
+				- Practical consequence: the pre-battle ADV scripts absolutely do stage TIMs, but the identified script-side loaders still stop at rows `0x1E0`, `0x1E3`, and `0x1E4`. They do not provide a new `ALL.TIM -> 0x1FF` explanation for the bad battle ANC tiles.
+				- High-confidence remaining model: row `0x1FF` for those battle ANC palettes is inherited VRAM state from some broader bootstrap / UI history or another unresolved non-scripted path, not from the visible pre-battle `BAT*.MES` script chain.
+				- Follow-up on the apparent `3xx` BAT-script commands explains the scene control more cleanly.
+					- `FUN_80028c14` is the higher-level ADV text/script walker. It treats byte `0xD0` as an escape into `FUN_80029a1c`, byte `0xD6` as a variable-assignment expression, and two-byte printable ranges as inline text glyphs.
+					- Practical consequence: tokens that looked like standalone commands such as `310`, `312`, `316`, and `332` are not opcodes `310` / `312` / etc. They are byte sequences `0xD0 0x33 <decimal digits>`, meaning ADV opcode `0x33` with a decimal argument.
+					- That mapping resolves the battle-entry script tokens directly:
+						- `310` = opcode `0x33` argument `10` -> `FUN_8002f694` (normal battle entry)
+						- `312` = opcode `0x33` argument `12` -> `FUN_80035844`
+						- `316` = opcode `0x33` argument `16` -> `FUN_800368dc`
+						- `332` = opcode `0x33` argument `32` -> sets `DAT_80085911 = 1` and then routes to `FUN_8002fe18`
+					- Raw-byte scans over the extracted `*.ES` corpus show `arg=10` throughout the main `BAT1*`, `BAT2*`, `BAT21*`, `BAT24*`, `BAT2MAP`, `QUA1MAP`, and `C_SMP` scripts; `arg=12` in `C_SMP` and `QUA2ND`; `arg=16` in `BAT3RD` and `C_SMP`; and `arg=32` in `BAT5TH`, `BATBL`, `BATPO`, `IVE4TH`, and `LAST1` / `LAST2` / `LAST3`.
+					- This means the battle-entry path is now grounded in exact script bytes rather than only in extracted ASCII strings.
+				- Tracing the battle wrappers themselves also tightened the `0x1FF` conclusion.
+					- `FUN_8002f694` and `FUN_8002fe18` both call `FUN_80020e24` before `SetupBattleScene`, but neither wrapper uploads a new battle palette TIM to row `0x1FF` before that setup call.
+					- Their explicit `LoadTimToVram(..., 0x1FF)` calls load `FONT88A.TIM` only after the battle loop / cleanup path.
+					- `FUN_80020e24` itself stages only `VS??.TIM` rows `0x1E0` and `0x1E1` plus `VS.ANM` pages rooted at `0x1E3`, yet it still renders resource ids `0x15`, `0x17`, and `0x19` against CLUT row `0x1FF` during the VS presentation.
+					- Focused caller tracing on `FUN_80018434` tightened that further: among the distinct direct-quad callers, only `FUN_80020e24` hardcodes `clutX = 0x140` and `clutY = 0x1FF`.
+					- `FUN_80020e24` has only four callers: two branches inside the front-end master loop `FUN_8001f968`, plus the wrappers `FUN_8002f694` and `FUN_8002fe18`.
+					- In all four cases, `FUN_80020e24` runs as a VS / pre-battle presentation step before `SetupBattleScene`; no traced active-battle HUD/helper function calls it directly.
+					- Practical consequence: the pre-battle presentation path is another concrete runtime proof that those resource ids can consume inherited `0x1FF` state without any local `0x1FF` palette upload.
+				- Direct inspection of `ALL.TIM` narrowed the remaining palette hypothesis further.
+					- The extracted `ALL     IM` TIM has flags `0x9`, CLUT block size `524`, CLUT dimensions `256 x 1`, and therefore carries only a single 256-color CLUT row.
+					- The saved `BCHARA00_auto_battle` / `ICHARA00_auto_battle` debug JSON shows every non-zero ANC tile attribute currently resolves to that same `ALL     IM (default row fallback)` source on runtime row `0x1FF`, specifically palette columns `1`, `2`, and `3` for attributes `1`, `2`, and `3`.
+					- Those same debug dumps show `PageSlot = 0` for the sampled battle character frames, which means the current extractor miss is not a hidden alternate slot-table entry. The missing runtime datum is still the registration-time base byte (`0x15` for the player file, `0x19` for the opponent file) and the unresolved inherited contents of row `0x1FF`.
+					- Practical consequence: the current bad effect tiles are already sampling the only CLUT row that `ALL.TIM` can provide. If those colors are wrong, the missing battle effect subpalettes are not hiding in some other `ALL.TIM` row that the extractor failed to use.
+					- High-confidence implication: the unresolved battle effect palettes likely come from a different source than `ALL.TIM`, even though `ALL.TIM` remains a plausible base-row fallback for attribute `0` tiles.
+					- Focused tracing on the non-scripted `0x1FF` path resolved the caller chain around `FUN_8001f968` and `FUN_80036300`.
+						- `start` calls `FUN_80014c5c`, and `FUN_80014c5c` immediately calls `FUN_8001f968`; this is the top-level front-end bootstrap rather than a scene-specific wrapper.
+						- At the start of `FUN_8001f968`, the game loads `FONT88A.TIM` and uploads it to VRAM row `0x1FF` before entering the main front-end loop. That happens before any later `FUN_80020e24` battle-presentation call in the same function.
+						- The same `FUN_8001f968` loop later reaches `FUN_80020e24` directly on the `DAT_800c6654 == 1` and `DAT_800c6654 == 3` branches, so the VS path can inherit row `0x1FF` from the bootstrap without any intervening battle-only loader.
+						- `FUN_80036300` is not a hidden non-scripted entry point: direct xrefs show a single caller from `FUN_80029a1c`, so it is another script-dispatch helper. Like the other identified `0x1FF` loaders, it uploads `FONT88A.TIM`, not a battle palette TIM.
+						- `FUN_8002ddec` is likewise only called from `FUN_80029a1c` and repeats the same `IV_MESW.TIM` / `FFACE.TIM` / `FONT88A.TIM -> 0x1FF` setup pattern.
+						- Practical consequence: suggestion 1 did identify a real pre-`FUN_80020e24` `0x1FF` source, but that inherited non-scripted state is still just the font CLUT. It does not yet explain the missing battle effect palettes as a separate authored battle TIM.
+						- `FUN_8002f694` and `FUN_8002fe18` now fit the same model precisely: both call `FUN_80020e24(...)`, then enter `SetupBattleScene(...)` / `FUN_8003a190()`, and only reload `FONT88A.TIM -> 0x1FF` after the battle loop returns.
+					- Follow-up tracing on the active battle/runtime path tightened that further.
+						- `FUN_8003be70` is only the continue-screen branch from `FUN_8001f968`: it creates a scratch TIM and uploads it to row `0x1ED` for `CONTINUE.ANN`, so it is not part of the normal battle effect-palette path.
+						- `FUN_8003a190` contains no active-combat `LoadTimToVram(..., 0x1FF)` path. Its only explicit TIM uploads are in the post-battle result branch, where it stages `BPARTS.TIM -> 0x1EA`, `IV_MESW.TIM -> 0x1E1`, and `RSLTBG*.TIM -> 0x1ED` before `RESULT.ANM`.
+						- `FUN_80039eac` is also update-only in the traced path: it advances battle state, actor logic, and HUD/control helpers, but does not upload TIM data.
+						- During active battle, `FUN_80028094` calls `DrawActiveAssetEntries()` before the mode-2 battle helpers (`FUN_8004ddf4`, `FUN_8004e7d4`, `FUN_80037e38`, `FUN_800476d4`). The traced direct callees of those helpers are draw/update routines, not TIM loaders.
+						- `DrawActiveAssetEntries` immediately routes into `RenderAssetEntries`, and `RenderAssetEntries` directly calls `QueueAncTileGrid` / `QueueRotatedAncTileGrid` without any intervening resource-upload path.
+						- Decompiling `LoadTimToVram` removed the strongest remaining false positive: its image and CLUT destinations are separate. So calls like `LoadTimToVram(DAT_800c14cc, 0x3C0, 0, 0, 0x1FF)` load `FONT88A.TIM` at image page `x = 0x3C0` but still upload the CLUT only to `x = 0`, `y = 0x1FF`.
+						- `SetupBattleScene` does invoke the direct `LoadImage` family, but not on row `0x1FF`: it calls `FUN_80021c1c()` before `LoadPackageAndMpk`, and `FUN_80021c1c` hardcodes `DAT_800c2c4c = 0x140`, `DAT_800c2c50 = 0xF0`, plus companion rows `0xF1` through `0xF5`.
+						- `LoadPackageAndMpk` is the only caller of `FUN_80021cc0`, so that package-side uploader cannot be a hidden battle `0x1FF` writer. In the battle path it only seeds the stage/package CLUT band at `x = 0x140`, `y = 0xF0..0xF5`, and `FUN_800221dc` merely uploads the matching page tiles for that same package viewport.
+						- The ANM path is different from both of those. `UploadAnmPagesToVram` first uploads a `0x100 x 1` palette row from each ANM page block, then uploads the page pixels themselves. The palette-row destination comes from `RegisterAnmSlotRange` as `(clutBase, textureBase)`.
+						- In the traced front-end / battle-adjacent paths, those ANM palette coordinates still do not line up with the bad ANC band. `FUN_80020e24` registers `VS.ANM` with `clutBase = 0`, `textureBase = 0x1E3`, while `SetupBattleScene` registers `BPART3.ANM` / `BPART4.ANM` with `clutBase = 0`, `textureBase = 0x1F1`.
+						- `FUN_80020e24` does have one explicit `MoveImage`, but it copies only the rectangle `x=0..0x13F`, `y=0xF0..0x1DF` into `x=0x140`, `y=0x100..0x1EF`. That range still excludes the traced `VS.ANM` palette rows starting at `y = 0x1E3`, so it is not a hidden relocation into the `x = 0x140`, `y = 0x1FF` ANC band.
+						- The remaining variable-driven TIM loaders also miss that band. `FUN_800273e8` only seeds `SCREEN.TIM` at `clutX = 0x340`, `clutY = 0x00FF`; the script-side `FUN_8002e174` face/pic table only configures rows `0x1E3` and `0x1E4`; and no traced `LoadTimToVram` caller or direct `LoadImage` caller writes `clutX = 0x140`, `clutY = 0x1FF`.
+						- A whole-binary `0x1FF` literal sweep did not reveal a hidden writer either. Beyond the known `FONT88A.TIM -> (clutX = 0, clutY = 0x1FF)` loaders and the `FUN_80020e24` consumer, the only other hits were `FUN_8001f05c(0x0F, 0, 0x1FF, 0)` (just a state setter for `DAT_800c1800` / `DAT_800c1802`) and `FUN_80015008`, which clears the entire VRAM rectangle `0..0x3FF` by `0..0x1FF` to black.
+						- Practical consequence: ANM files absolutely can be a palette source, but the traced ANM palette rows land at `x = 0`, not at the `x = 0x140` row used by the bad `resourceId 0x15 / 0x17 / 0x19` ANC draws in `FUN_80020e24`. So ANM does not currently explain that specific wrong-color ANC path.
+						- Practical consequence: the unresolved problem is now narrower than plain “row `0x1FF` inheritance”. `FUN_80020e24` consumes `clutX = 0x140`, `clutY = 0x1FF`, but the traced explicit writers only populate `x = 0`, `y = 0x1FF` (`FONT88A.TIM`), `x = 0x140`, `y = 0xF0..0xF5` (package CLUTs), or `x = 0`, `y = 0x1E3` / `0x1F1` (ANM rows). So the specific `x = 0x140`, `y = 0x1FF` band currently appears to be stale / inherited VRAM state from an as-yet unresolved path, not a directly traced authored CLUT upload.
+- `FUN_800239f8` is now understood as the package-side counterpart to the explicit TIM loaders.
+	- It loads the requested package into a resource slot, trims the slot to the parsed size, then calls `FUN_8002351c(0, 300)` to seed all 300 asset entries from the package-derived tables.
+	- `FUN_8002351c` writes the first five `PageSlot` lookup entries for each asset entry: base bytes at `DAT_8008d2a0`, companion mode bytes at `DAT_8008d2ac`, and paired 16-bit values at `DAT_8008d2b8` / `DAT_8008d2d0` that `RenderAssetEntries` later forwards into the sprite / ANC draw helpers.
+	- It then constructs the matching `.MPK` name from the same basename and loads that sidecar into slot `0`.
+	- Practical consequence: some scenes get their render metadata and CLUT/tpage bases from package tables plus an `.MPK` sidecar, while battle ANC / ANN still rely on separately staged TIM palette rows. The script interpreter is not the component that mutates those lookup tables later.
+- `CONTINUE.ANN` is a special case.
+	- Its scene first calls `CreateBlankTimResource(0, 0x140, 0xF0, 1, 0)` to synthesize a blank 8bpp TIM buffer in RAM.
+	- The scene then uploads that synthetic TIM with `LoadTimToVram(..., 0x340, 0x100, 0, 0x1ED)` before loading `CONTINUE.ANN`.
+	- This means the continue screen does not rely on a palette embedded in `CONTINUE.ANN`; it seeds a scratch texture/CLUT bank first and then renders the ANN against that prepared VRAM state.
+	- The exact final color source for CONTINUE still needs tightening, because the synthesized TIM starts blank and may be modified or used as a mask-style bank rather than as a normal authored palette.
+- `BSELECT.ANM` does not need an external palette source for its main animated elements.
+	- The menu scene loads several TIM files for UI/background art (`IV_MESW2.TIM`, `MDVS.TIM`, `MDBFACE.TIM`, `VSBG00.TIM`, `GRADBG.TIM`), but the main `BSELECT.ANM` palette data is still embedded in the ANM page blocks and uploaded by `UploadAnmPagesToVram`.
+- Extractor implication:
+	- Real-color ANM export can be self-contained.
+	- Real-color ANN / ANC export needs the relevant scene TIM palette banks or an equivalent recovered CLUT reconstruction step.
+- Parameter observations for `FUN_80036990`:
+	- `param_1`: first / player-side fighter character id.
+	- `param_2`: second / opponent-side fighter character id.
+	- `param_3`: arena / stage id used to select the `MAP0x.MP` / `MAP1x.MP` background.
+	- `param_4`: battle setup mode controlling a small cluster of globals (`DAT_800c4f88`, `DAT_800c2b98`, `DAT_800c4840`). Exact semantic name still uncertain.
+	- `param_5`: timer / pacing preset that maps to values such as `0x14`, `0x1e`, `0x3c`, `0x5a`, `0x78`, `1000` through `DAT_800c5590`.
+	- `param_6`: currently unused inside this function.
+	- `param_7`: persists beyond setup; later read by `FUN_800455a8`, where it changes damage scaling for at least one combatant side. This looks like a battle-side scaling / handicap mode.
+	- `param_8`: copied into globals and read later by battle-loop code, but its exact purpose is still unresolved.
+	- `param_9`: copied into globals but not yet tied to a clear downstream behavior.
+	- The renamed decompile is now substantially clearer: `SetupBattleScene` shows the ANC / ANN / ANM pipeline directly through `LoadFileIntoResourceSlot`, `RegisterAncSlotRange`, `UploadAncTextureData`, `RegisterAnnSlotRange`, `UploadAnnTextureData`, `RegisterAnmSlotRange`, and `UploadAnmPagesToVram`.
+	- Local-variable interpretation inside `SetupBattleScene`:
+		- `local_48` / `local_44` / `local_40` / `local_3c`: scratch filename builder used for `BFAC*`, `MAP*`, `BCHA*`, `ICHA*`, and `FCHA*` asset names.
+		- `local_30`: arena-derived table offset used when reading per-stage fighter placement data.
+		- `psVar14` / `psVar15`: iterators over the per-stage ambient/effect spawn table at `DAT_800118e0`.
+		- `puVar9`: cursor over the combatant slot array rooted at `DAT_800c2cc0`.
+		- `iVar12`: active character id assigned to the current combatant slot during roster initialization.
+		- `uVar5` / `uVar6`: per-combatant placement coordinates pulled from the stage placement table at `DAT_800117f8`.
+		- `uVar1` / `uVar2` / `cVar3`: per-character presentation values pulled from `DAT_800116fc` when initializing each combatant slot.
+
+## Rename Decisions
+
+- Planned / applied renames:
+	- `FUN_80036990` -> `SetupBattleScene`
+	- `FUN_8001c508` -> `LoadFileIntoResourceSlot`
+	- `FUN_8001d6f8` -> `ReleaseResourceSlot`
+	- `FUN_8001d73c` -> `TrimResourceSlotToUsedSize`
+	- `FUN_8001d794` -> `ReserveResourceSlotBuffer`
+	- `FUN_8001883c` -> `ClearAssetRegistryTables`
+	- `FUN_800186a4` -> `LoadTimToVram`
+	- `FUN_8001c998` -> `CreateBlankTimResource`
+	- `FUN_800239f8` -> `LoadPackageAndMpk`
+	- `FUN_8001a480` -> `RegisterAncSlotRange`
+	- `FUN_8001a55c` -> `UploadAncTextureData`
+	- `FUN_8001aa84` -> `RegisterAnnSlotRange`
+	- `FUN_8001a3a4` -> `UploadAnnTextureData`
+	- `FUN_8001a030` -> `RegisterAnmSlotRange`
+	- `FUN_8001a170` -> `UploadAnmPagesToVram`
+	- `FUN_80018a70` -> `StepAssetEntryScript`
+	- `FUN_80018748` -> `ResetAssetEntryState`
+	- `FUN_8001a888` -> `ActivateAssetEntry`
+	- `FUN_8001a970` -> `UpdateActiveAssetEntries`
+	- `FUN_8001aa54` -> `DrawActiveAssetEntries`
+	- `FUN_800194b4` -> `RenderAssetEntries`
+	- `FUN_80015f3c` -> `QueueSpriteQuad`
+	- `FUN_80017270` -> `QueueAncTileGrid`
+	- `FUN_800168f8` -> `QueueRotatedAncTileGrid`
+- Applied signature upgrades in Ghidra where the MCP operation accepted them:
+	- `SetupBattleScene`
+	- `LoadFileIntoResourceSlot`
+	- `ReleaseResourceSlot`
+	- `TrimResourceSlotToUsedSize`
+	- `UploadAncTextureData`
+	- `RegisterAnmSlotRange`
+- Added function comments in Ghidra for:
+	- `SetupBattleScene`
+	- `LoadFileIntoResourceSlot`
+- Limitation:
+	- Local-variable rename support was not exposed by the available Ghidra MCP tools, so local-name improvements are documented here rather than applied directly in the database.
+
+## Open Questions
+
+- Confirm the exact semantic names for `param_4`, `param_8`, and `param_9` in `SetupBattleScene`.
+- Trace the battle-loop reads of `DAT_800c55b8` and `DAT_800c6a2c` to replace the remaining tentative parameter names.
+- Find the deeper runtime consumers of ANC / ANN / ANM entries after the initial VRAM upload stage.
+- Confirm the exact meaning of the frame-descriptor fields at `assetBase + 0x4c0 + frameIndex * 10` and the per-entry lookup tables at offsets `+0x08`, `+0x14`, `+0x20`, and `+0x38`.
+- Determine whether `FUN_800177c4` is a dormant alternate tiled renderer or belongs to another asset variant not yet traced through the slot registration path.
+- Turn the current render-path findings into an external extractor:
+	- parse the shared frame table,
+	- reproduce `StepAssetEntryScript` state updates as needed,
+	- emulate `QueueSpriteQuad` for `.ANM` / `.ANN`,
+	- emulate `QueueAncTileGrid` / `QueueRotatedAncTileGrid` for `.ANC`.

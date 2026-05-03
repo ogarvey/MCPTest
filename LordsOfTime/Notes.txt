@@ -1,0 +1,5 @@
+0x22dd3a Ghidra == 0x43eea UAE ==> 0x1E9E50 
+
+  FUN_00230cfa(); => 46EAA
+  FUN_0022c3fc(); => 425AC
+  FUN_0022e07c(); => 4422C

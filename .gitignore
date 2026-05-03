@@ -1,0 +1,8 @@
+JoJo (SLES 025.99)/JojoExtractor/bin/
+JoJo (SLES 025.99)/out/
+**/bin/**
+**/obj/**
+*/**/bin/**
+*/**/obj/**
+**/[Ss]amples/**
+**/[Tt]est**/**

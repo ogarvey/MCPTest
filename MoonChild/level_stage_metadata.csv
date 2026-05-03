@@ -1,0 +1,20 @@
+slot,level,stage,active,para_pcx,pats_pcx,map_file,col_file,width_hex,height_hex,width_dec,height_dec,field_14_ptr,field_18_ptr,notes
+11,1,1,true,"assets\\para1.pcx","assets\\pats1.pcx","lvl11.map","lvl11col.map",0x1E00,0x05A0,7680,1440,0x004185E0,0x004410A8,
+12,1,2,true,"assets\\para1.pcx","assets\\pats1.pcx","lvl12.map","lvl12col.map",0x1E00,0x12C0,7680,4800,0x00418A50,0x004410E8,
+13,1,3,true,"assets\\para1.pcx","assets\\pats1.pcx","lvl13.map","lvl13col.map",0x0780,0x2580,1920,9600,0x00418EC0,0x00441110,
+14,1,4,true,"assets\\para1.pcx","assets\\pats1.pcx","lvl14.map","lvl14col.map",0x4B00,0x0500,19200,1280,0x00419680,0x00441188,
+
+21,2,1,true,"assets\\para2.pcx","assets\\pats2.pcx","lvl21.map","lvl21col.map",0x0F00,0x1900,3840,6400,0x00419B30,0x004411E8,
+22,2,2,true,"assets\\para2.pcx","assets\\pats2.pcx","lvl22.map","lvl22col.map",0x0F00,0x1F40,3840,8000,0x00419FE0,0x00441218,
+23,2,3,true,"assets\\para2.pcx","assets\\pats2.pcx","lvl23.map","lvl23col.map",0x03C0,0x4B00,960,19200,0x0041A400,0x004412A8,
+24,2,4,true,"assets\\para2.pcx","assets\\pats2.pcx","lvl24.map","lvl24col.map",0x2580,0x2580,9600,9600,0x0041ACD0,0x00441300,
+
+31,3,1,true,"assets\\para3.pcx","assets\\pats3.pcx","lvl31.map","lvl31col.map",0x0F00,0x1900,3840,6400,0x0041B630,0x00441310,
+32,3,2,true,"assets\\para3.pcx","assets\\pats3.pcx","lvl32.map","lvl32col.map",0x0F00,0x1900,3840,6400,0x0041BEF0,0x00441380,
+33,3,3,true,"assets\\para3.pcx","assets\\pats3.pcx","lvl33.map","lvl33col.map",0x4B00,0x0960,19200,2400,0x0041C0F0,0x004413C0,
+34,3,4,true,"assets\\para3.pcx","assets\\pats3.pcx","lvl34.map","lvl34col.map",0x23F0,0x23F0,9200,9200,0x0041CBC0,0x00441418,"Only non-32-aligned stage. lvl34col.map is a regular 575x575 byte grid; lvl34.map is not a fixed-width short rectangle and is indexed from pixel width 9200."
+
+41,4,1,true,"assets\\para4.pcx","assets\\pats4.pcx","lvl41.map","lvl41col.map",0x2580,0x2580,9600,9600,0x0041F060,0x00441458,
+42,4,2,false,,,,,0x0000,0x0000,0,0,0x00000000,0x00000000,
+43,4,3,false,,,,,0x0000,0x0000,0,0,0x00000000,0x00000000,
+44,4,4,false,,,,,0x0000,0x0000,0,0,0x00000000,0x00000000,

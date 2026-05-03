@@ -1,0 +1,17 @@
+- Fantastic Dizzy screen loader root is `LoadScreenByIndex` at `0x00005930`; it indexes `ScreenDescriptorTable` at `0x0003E474`.
+- Sample descriptor chain: table[0] -> descriptor `0x0003E5AE` -> per-screen `IMP!` block `0x00071804`.
+- `VDP_SetVRAMWriteAddress` at `0x00000A42` is the generic VRAM write helper used by the room and common tile loaders.
+- `LoadRoomTilesAndTilemap` at `0x000053EE` decompresses a screen block to `0xFFFF0100` with layout: `u16 tileCount, u16 mapWidth, u16 mapHeight, 16 palette words, mapWidth*mapHeight tile words, tileCount*0x20 bytes tile graphics`.
+- `LoadRoomTilesAndTilemap` uploads room-specific tiles first, then writes a 64-column plane map at VRAM `0xC000`; each map word becomes `tileBase + tileWord | 0x2000`.
+- `LoadCommonScreenTiles` at `0x000054A0` decompresses a fixed common tile bank from `0x00073638` and appends it after the room-specific tiles.
+- `FUN_00000A84` clears two VRAM regions before room build: `0x600` words in the plane-map region and `0x800` words in the base pattern region.
+- `0xFFFF9F4C..0xFFFF9FCB` is the 64-word target palette workspace; the room block writes its 16 colors to `0xFFFF9F6C`, which is palette line 1 inside that buffer.
+- `0xFFFF9FCC..0xFFFFA04B` is the live 64-word CRAM image buffer; `FUN_00000814` builds it from the target palette workspace and `FUN_00000860` uploads it to hardware.
+- Descriptor longword `+0x04` usually feeds `FUN_0000588C` as an 8-byte pair list: `[packed IMP! chunk source, 5-word chunk-definition list]`. `FUN_00001F38` expands those into chunk templates at `0xFFFFBCCA` and sets `DAT_ffff805A` for later overlay references.
+- Some screens also appear to store a direct 5-word chunk-definition list at descriptor `+0x04`, using the current room block as the source tilemap; screen `30` (`0x0003EC90 -> 0x00040B4C`) is the current example.
+- Descriptor word `+0x08` feeds `FUN_000058CC`, which selects a text/label script from the RAM pointer table at `0xFFFF6000`.
+- Descriptor words `+0x0A..` are 3-word overlay chunk records terminated by `0xFFFF` and consumed by `FUN_00005904` via `FUN_000021E2`.
+- `Sega/MegaDrive/FantasticDizzy/extract_room_screens.py` now covers the base room-background path plus chunk-template building and overlay compositing.
+- Verified sample: screen `0` (`0x071804`, `40x24`) renders with `79` chunk templates and `1` visible overlay after the `0xC500` chunk-tail decode path.
+- Verified sample: screen `30` (`0x040EC4`, `40x15`) still renders the room cleanly and builds `78` chunk templates from its direct chunk-definition list, but its current overlay record produces `0` visible pixels and still needs interpretation.
+- Full Capstone disassembly of `FUN_0000C2B0` confirms the chooser's `C134` calls are fed a pre-masked `D5`: the `flag < 0 && above == current` branch excludes that symbol once, and the non-equality "decode a fresh symbol" branches exclude both `current` and `above` before decoding.
