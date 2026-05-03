@@ -1,0 +1,24 @@
+- Zyclunt LE / Borland code has multiple mis-bounded functions in Ghidra: many entries show only `push frame_size ; call 0x000bb0f4` or similar prologues.
+- When this happens, use `memory_read` immediately after the prologue address; real code often starts at `entry + 0x0a`.
+- Strong archive lookup anchor: raw code at `0x0002c085` opens `zyclunt.jam` in `rb`, checks `JAM2File`, then iterates fixed-size records comparing names.
+- `0x00037b1c` is a caller that forwards a requested asset name into the `zyclunt.jam` lookup path.
+- Actual start of the old `fix_off32_00013faf` path is `0x00013fac`; it loads `standard.ish` from `zyclunt.jam`, not CAD directly.
+- Actual body of `0x0001332d` loads a `standard.ish` table structure: count, count*9-byte names, count*0x10-byte records.
+- Strong CAD anchors: `0x0002bf78` copies a basename and appends `.cad`; `0x0002c1cc` opens `<basename>.cad` from `zyclunt.jam`, verifies `CAD`, and reads the sequence `u16 unk0, u8 aux_flag, optional 0x400-byte aux block, u16 unk1, u32 raw_data_size, raw_data, u16 count_5e, count_5e*0x5e, u16 count_6, count_6*6, u16 count_4, count_4*4`.
+- `0x000bc266` is used as a skip/seek helper for the optional 0x400-byte CAD aux block when the caller does not provide a destination buffer.
+- CAD table relationships: 0x5e-byte records hold raw-data-relative offsets at +0x56/+0x5a; 6-byte records hold 0x5e-table-relative dword offsets plus a trailing word; 4-byte records hold offsets into the 6-byte table.
+- Runtime CAD slot layout repeats every 0x12 bytes: raw at `0x10049e + slot*0x12`, 0x5e table at `0x1004a2 + slot*0x12`, 6-byte table at `0x1004a6 + slot*0x12`, 4-byte sequence-start table at `0x1004aa + slot*0x12`.
+- Runtime object state uses `obj+0x14` for the selected 4-byte sequence table, `obj+0x10` for the current 6-byte entry, `obj+0x0c` for the current 0x5e frame record, and `obj+0x0a` for the 6-byte entry's trailing word.
+- Raw code at `0x0002d520` shows late 0x5e fields are draw metadata: `+0x4c` gates single vs composite draw, `+0x4e/+0x50` and `+0x52/+0x54` are part offsets, `+0x56/+0x5a` are image-data pointers fixed up by the loader.
+- Raw draw callers at `0x00060d0c`, `0x000604d9`, and `0x00063409` prove frame words `+0x00` and `+0x02` are draw-anchor offsets added to the object's X/Y before queueing the image.
+- The raw data behind `dword[frame+0x56]` begins with little-endian `u16 width, u16 height`; examples: `1up` chunks are `22x35`, `b1` chunk 0 is `50x60`, and `b1` chunks at `0x0780`/`0x0dd3` are `43x61`.
+- Raw chunk decoder recovered from `0x000b51cf`: `0xff` = end row, `0x00 <skip>` = transparent skip, `0x01..0x7f` = literal copy, `0x80..0xfe` = repeat packet using the following dword pattern and the exact `stosb`/`stosd` semantics from the binary.
+- Current extracted raw chunks all decode successfully with that grammar and leave one trailing pad byte in the present samples.
+- Raw code at `0x00041a70`, `0x00060d16`, and `0x0006509a` proves `obj+0x0a` is decremented as an animation countdown. On zero, the engine advances `obj+0x10` by 6, reloads the frame pointer from `dword[entry]`, and reloads `obj+0x0a` from `word[entry+4]`.
+- In the 6-byte CAD table, `dword == -2` is a loop/backtrack sentinel and uses `word[entry+4]` as a rewind byte count. `dword == -1` is a caller-specific transition/control sentinel.
+- Raw code at `0x0001004a` copies a runtime-initialized 48-byte table from `0x00100010`, selects an 8-byte basename by `major*8`, loads the stage palette string from `0x0001d077 + major*0x22fa + 0x2b`, then calls `0x0002c1cc` to load the startup CAD.
+- Local tooling: `DOS/Zyclunt/ZyCleaver` now parses CAD samples, emits JSON summaries, dumps unique width/height-prefixed raw image chunks, and decodes extracted chunk `.bin` files to debug PNGs.
+- Sample-validated CAD examples: `1up.cad` => `unk1=3`, `blob=1830`, `count_5e=4`, `count_6=5`, `count_4=1`; `b1.cad` => `unk1=48`, `blob=63875`, `count_5e=50`, `count_6=64`, `count_4=14`.
+- Confirmed literal CAD basenames from callers: `acsr`, `title`, `ending`, `endroll`, `sclear`, and likely `sou`.
+- Stage table layout for dynamic CAD names: subtable size `0x197`, major size `0x22fa`, with CAD name list A at `+0x51` (count at `+0x4f`) and CAD name list B at `+0x12b` (count at `+0x129`), each record `{u16 id; char name[10]}`.
+- Dynamic stage CAD names recovered directly from the binary include `1up`, `b1`, `boss1`, `dmkmk2`, `fwing`, `st2stone`, `bart`, `vajar`, `train`, and many others.
