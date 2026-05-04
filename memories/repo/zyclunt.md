@@ -16,9 +16,34 @@
 - Current extracted raw chunks all decode successfully with that grammar and leave one trailing pad byte in the present samples.
 - Raw code at `0x00041a70`, `0x00060d16`, and `0x0006509a` proves `obj+0x0a` is decremented as an animation countdown. On zero, the engine advances `obj+0x10` by 6, reloads the frame pointer from `dword[entry]`, and reloads `obj+0x0a` from `word[entry+4]`.
 - In the 6-byte CAD table, `dword == -2` is a loop/backtrack sentinel and uses `word[entry+4]` as a rewind byte count. `dword == -1` is a caller-specific transition/control sentinel.
-- Raw code at `0x0001004a` copies a runtime-initialized 48-byte table from `0x00100010`, selects an 8-byte basename by `major*8`, loads the stage palette string from `0x0001d077 + major*0x22fa + 0x2b`, then calls `0x0002c1cc` to load the startup CAD.
+- Raw code at `0x0001004a` copies a static 48-byte table from `0x00010010`, selects an 8-byte basename by `major*8`, loads the stage palette string from `0x0001d077 + major*0x22fa + 0x2b`, then calls `0x0002c1cc` to load the startup CAD.
+- The static startup basename table at `0x00010010` contains `st1_le`, `st2_le`, `st3_le`, `st4_le`, `st5_le`, and `st6_le`, which map source-backed to sub-0 palettes `st1_h`, `st2_s`, `st3_s`, `st4_s`, `st5_s`, and `st6_s`.
 - Local tooling: `DOS/Zyclunt/ZyCleaver` now parses CAD samples, emits JSON summaries, dumps unique width/height-prefixed raw image chunks, and decodes extracted chunk `.bin` files to debug PNGs.
 - Sample-validated CAD examples: `1up.cad` => `unk1=3`, `blob=1830`, `count_5e=4`, `count_6=5`, `count_4=1`; `b1.cad` => `unk1=48`, `blob=63875`, `count_5e=50`, `count_6=64`, `count_4=14`.
 - Confirmed literal CAD basenames from callers: `acsr`, `title`, `ending`, `endroll`, `sclear`, and likely `sou`.
 - Stage table layout for dynamic CAD names: subtable size `0x197`, major size `0x22fa`, with CAD name list A at `+0x51` (count at `+0x4f`) and CAD name list B at `+0x12b` (count at `+0x129`), each record `{u16 id; char name[10]}`.
 - Dynamic stage CAD names recovered directly from the binary include `1up`, `b1`, `boss1`, `dmkmk2`, `fwing`, `st2stone`, `bart`, `vajar`, `train`, and many others.
+- Stage subtable field `+0x2b` is the palette filename for that scene slice. Palette choice is stage-specific, not globally CAD-specific.
+- Binary-backed `b1` palette hits are stage 1 (`st1_h.pal`, `st1_1.pal`, `st1_2.pal`) and stage 4 (`st4_s.pal`, `st4_2.pal`, `st4_1.pal`). `st6_b1.pal` belongs to stage-6 sub-1, whose asset list includes `boss1` but not `b1`.
+- Full recovered `1up` stage-table coverage spans many palettes across majors 0..5; use `--suggest-palettes` for the current summary list instead of assuming a single match.
+- The generated stage-table JSON now covers 88 of the 104 CADs under `Samples/CadFiles`.
+- Most `Samples/PalFiles/*.pal` files are 768-byte VGA palettes with 6-bit RGB components; several `*_tran.pal` / `*t.pal` files are 65536-byte tables and are not plain palettes.
+- `DOS/Zyclunt/ZyCleaver` now supports `--palette <file>` for `--decode-chunks`, scales 6-bit VGA components to 8-bit RGB, and tracks written-pixel masks so palette index 0 is not mistaken for transparency.
+- For explicit CAD inputs, `DOS/Zyclunt/ZyCleaver` now exports per-palette folders under `DOS/Zyclunt/TestOutput/rendered-frames/<cad name>/<palette name>`, with tight native frame PNGs in `frames/` and sequence-local aligned PNGs in `sequences/sequenceXXXX/`.
+- The palette export manifest `<cad>.frames.json` now includes both per-frame native bounds and per-sequence canvas/alignment data, plus the raw sequence table/start metadata.
+- `DOS/Zyclunt/ZyCleaver` also supports `--all-palettes` for explicit CAD inputs, exporting one palette folder per currently known palette candidate found on disk.
+- `PaletteHintCatalog` now prefers the live project `PaletteHintStageData.json` over the copied output copy when the source-tree file exists, so `dotnet run --no-build` sees current palette-table edits.
+- Focused validation: `dotnet run -- ..\Samples\CadFiles\jim.cad` selected `st6_jck.pal` from the current stage-data file and wrote 66 native frames plus 22 sequence folders under `TestOutput/rendered-frames/jim/st6_jck`.
+- Focused validation: `dotnet run -- --all-palettes ..\Samples\CadFiles\rides4.cad` wrote separate `st4_1` and `st4_2` palette exports under `TestOutput/rendered-frames/rides4`.
+- Non-stage literal palette loads recovered from raw code: `title` opens `title.pal` from `zyclunt.jam` at `0x32c22` before loading `title.cad`; `ending` opens `ending.pal` at `0x35c76`, loads `ending.cad` and `endroll.cad`, and later scales the 0x300-byte palette at `0xf7498` for fades; `sclear` opens `sclear.pal` at `0x374c2`, then loads `sclear.cad` and `sou.cad` under that same palette setup.
+- `Samples/PalFiles` already contains `title.pal` and `ending.pal`; representative raw-chunk decodes validated against those files.
+- `DOS/Zyclunt/ZyCleaver` now supports `--suggest-palettes` and `--export-palette-table`; palette-suggestion inputs default to `Samples/CadFiles`, and the default sample/raw/palette directory helpers were fixed to resolve from the project root instead of one level too high.
+- Current exported coverage in `DOS/Zyclunt/CadPaletteTable.csv`: 99 resolved / 104 total. Remaining unresolved names are `acsr`, `laser2`, `logo`, `st3_ani`, and `yoni`.
+- Raw full-image ASCII scan found no `laser2`, `st3_ani`, `yoni`, `logo.pal`, or `logo.cad` strings in `ZYCLUNT.LE`; only `logo.exe %d` appears, at `0x000c004a`.
+- Raw code at `0x000103fd..0x00010422` formats `logo.exe %d` and passes it with `dos4gw` to another routine, so the `logo` asset path is owned by an external module rather than the main CAD loader.
+- Direct raw stage-table dumps show stage 3 contains `st3_1ani`, `st3_2ani`, and `laser1`, while stage 5 contains `st5_ani` and `yoni'`; plain `laser2`, `st3_ani`, and `yoni` are absent from the main stage-name tables.
+- Structural family matches: `laser2.cad` closely matches `laser1.cad`; `yoni.cad` is an exact container-level twin of `yoni'.cad`; `st3_ani.cad` shares the 2-frame/3-entry/1-sequence intro-screen layout used by `st*_le`, `st3_1ani`, and `st6_ani`.
+- Those family matches are useful heuristic leads, but they are not source-backed palette loads from `ZYCLUNT.LE`; resolving them strictly will require other modules/data such as `logo.exe` or the runtime-built resource tables behind `standard.ish`.
+- `jim` and `pred` are stage-backed after all: `jim` => `st4_1`, `st4_2`, `st6_jck`; `pred` => `st3_boss`, `st3_k`, `st3_z`, `st6_b4`, `st6_p`.
+- Raw code at `0x00031feb..0x00032075` directly loads `st2_tran.pal`, `st4_tran.pal`, and `st6_tran.pal` from `zyclunt.jam` as `0x10000`-byte tables for stage majors `1`, `3`, and `5`, storing the buffer pointer at `0x000f6e30`.
+- `0x0002cb33..0x0002cb77` is a standalone `acsr.cad` load path into the `0x001005ee` slot block, but its consumer is still unresolved; the only direct slot references recovered so far besides the loader are the free/reset path at `0x0002c69b..0x0002c6f5`.

@@ -57,6 +57,8 @@ internal sealed class CadFile
 internal sealed record CadFrameRecord(
     int Index,
     byte[] Bytes,
+    short AnchorX,
+    short AnchorY,
     ushort CompositeFlag,
     short Part1X,
     short Part1Y,

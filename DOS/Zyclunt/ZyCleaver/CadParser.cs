@@ -151,6 +151,8 @@ internal static class CadParser
 
     private static CadFrameRecord ParseFrameRecord(int index, byte[] bytes, int rawDataLength)
     {
+        var anchorX = ReadInt16(bytes, 0x00);
+        var anchorY = ReadInt16(bytes, 0x02);
         var compositeFlag = ReadUInt16(bytes, 0x4c);
         var part1X = ReadInt16(bytes, 0x4e);
         var part1Y = ReadInt16(bytes, 0x50);
@@ -172,6 +174,8 @@ internal static class CadParser
         return new CadFrameRecord(
             index,
             bytes,
+            anchorX,
+            anchorY,
             compositeFlag,
             part1X,
             part1Y,

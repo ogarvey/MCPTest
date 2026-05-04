@@ -140,7 +140,7 @@
 
 ### 2026-05-03 - Early startup CAD path around `0x00010040`
 - The apparent stub at `0x00010040` is another Borland stack-check entry; raw bytes show the real body starts at `0x0001004a`.
-- That body allocates `0x30` bytes of stack space, then copies 12 dwords from `0x00100010` into a local buffer via `rep movsd`.
+- That body allocates `0x30` bytes of stack space, then copies 12 dwords from `0x00010010` into a local buffer via `rep movsd`.
 - It uses the incoming stage-major index in `AX` to select an 8-byte entry from that local buffer:
 - `basename_ptr = (stack_copy_base = ESP + 4) + major * 8`
 - It separately derives a stage record at `0x0001d077 + major * 0x22fa` and loads the palette-like string at `stage + 0x2b` through the normal archive open helper `0x0002bfa7`.
@@ -154,7 +154,8 @@
 - `esi = [esi]`
 - `eax = [esi]`
 - `call 0x0002d520` with screen coordinates `(0x4d, 0x54)`
-- Important limitation: `0x00100010` is zero in the static image, so this basename table is runtime-initialized elsewhere. The startup caller structure is now clear, but the exact strings in that table are still unresolved.
+- The copied static table at `0x00010010` contains six 8-byte basename entries directly in the image: `st1_le`, `st2_le`, `st3_le`, `st4_le`, `st5_le`, and `st6_le`.
+- This makes the startup CAD/palette pairings source-backed: the startup path loads `st1_le` with `st1_h.pal`, `st2_le` with `st2_s.pal`, `st3_le` with `st3_s.pal`, `st4_le` with `st4_s.pal`, `st5_le` with `st5_s.pal`, and `st6_le` with `st6_s.pal`.
 
 ### 2026-05-03 - Runtime CAD pointer chain and frame draw semantics
 - The CAD output globals are not singletons; they participate in a repeating slot layout with stride `0x12` bytes.
@@ -224,7 +225,122 @@
 - every currently extracted chunk consumed all but one trailing byte
 - the trailing byte is consistently padding in the current samples, not additional image data required by the row bytecode loop
 - visual sanity check: the decoded `1up` chunk produces a plausible sprite silhouette in `DOS/Zyclunt/TestOutput/decoded-chunks`
-- Current conclusion: we now have a working raw chunk decoder for the extracted CAD image payloads, albeit using a debug palette rather than the game's real palette.
+- Current conclusion: we now have a working raw chunk decoder for the extracted CAD image payloads. The standalone tool originally used a debug palette, and now also supports loading the 768-byte game `.pal` files directly for actual-color PNG export.
+
+### 2026-05-03 - Stage tables are the sure-fire palette matcher for stage-driven CADs
+- The stage subtable at `0x0001d077 + major * 0x22fa + sub * 0x197` contains the palette filename at `+0x2b`, before the CAD basename lists at `+0x51` and `+0x12b`.
+- This means palette selection is stage/subtable-specific, not globally keyed by CAD basename.
+- Recovered hits for `b1` from the binary stage tables:
+- major 0 sub 0..1 => `st1_h.pal`
+- major 0 sub 2..3 => `st1_1.pal`
+- major 0 sub 4 => `st1_2.pal`
+- major 3 sub 0 => `st4_s.pal`
+- major 3 sub 1..3 => `st4_2.pal`
+- major 3 sub 4 => `st4_1.pal`
+- `st6_b1.pal` is not a source-backed match for `b1.cad`. The stage-6 sub-1 table uses `st6_b1.pal` and its asset list contains `boss1`, `lamia`, and the generic gear assets, but not `b1`.
+- This makes `boss1.cad` the strongest current CAD candidate for `st6_b1.pal`, while `b1.cad` should be tested against the stage 1 / stage 4 palettes depending on the desired scene context.
+
+### 2026-05-03 - Plain `.pal` format and tool support
+- Most files under `Samples/PalFiles` are exactly 768 bytes, which matches 256 RGB triplets.
+- Hex inspection of `st1_h.pal` shows channel values in the `0x00..0x3f` range, consistent with 6-bit VGA DAC components.
+- `DOS/Zyclunt/ZyCleaver` now accepts `--palette <file>` with `--decode-chunks`, loads those 768-byte palettes as VGA 6-bit RGB, and emits palette-colored PNGs.
+- When explicit CAD inputs are supplied, `DOS/Zyclunt/ZyCleaver` now exports per-palette folders under `TestOutput/rendered-frames/<cad>/<palette>/`.
+- Each palette export contains `frames/` with one tightly-bounded PNG per CAD frame, plus `sequences/sequenceXXXX/` folders with sequence-local aligned PNGs. Sequence canvases are computed from the frames referenced by that sequence start's 6-byte entry slice, using the proven frame anchor offsets at `+0x00/+0x02` plus the composite-part deltas at `+0x4e..+0x54`.
+- The companion `<cad>.frames.json` manifest now records both the native per-frame bounds and the per-sequence canvas/alignment data, along with the sequence table/start metadata needed to replay or inspect those sequences.
+- `DOS/Zyclunt/ZyCleaver` now also accepts `--all-palettes` for explicit CAD inputs, exporting one such palette folder for every currently known palette candidate that exists on disk.
+- `DOS/Zyclunt/ZyCleaver` now supports both `--suggest-palettes` and `--export-palette-table <output.csv>`, using a generated stage-table data file plus manual literal-palette overlays.
+- The stage-derived palette data now lives in `ZyCleaver/PaletteHintStageData.json`; when running from the source tree, the CLI now prefers that live project file over any copied build artifact so `dotnet run --no-build` sees current palette-table edits.
+- While adding that mode, the default path helpers were corrected to resolve from the `ZyCleaver` project root. The old helpers walked one directory too high from `AppContext.BaseDirectory`, which would have broken default sample/raw/palette discovery outside explicitly passed paths.
+- Palette suggestion and export mode now default to `Samples/CadFiles` when that directory exists.
+- Important decoder fix: transparency must come from the raw-chunk skip opcodes, not from `paletteIndex == 0`. Written pixels using palette index 0 are valid image data.
+- Focused validation succeeded with:
+- `dotnet run -- --decode-chunks ..\TestOutput\decoded-chunks-st1h --palette ..\Samples\PalFiles\st1_h.pal ..\TestOutput\raw-chunks\b1_off000000_50x60.bin`
+- Result: decoded `50x60`, consumed `1919/1920` bytes, reported `1411` written pixels, and produced `TestOutput/decoded-chunks-st1h/b1_off000000_50x60.png`.
+- Focused validation for the exported full CAD table succeeded with:
+- `dotnet run -- --export-palette-table ..\CadPaletteTable.csv ..\Samples\CadFiles`
+- Result: the generated table now covers `99 / 104` CAD files and leaves `5` unresolved.
+- Focused validation for the new aligned-frame CAD export succeeded with:
+- `dotnet run -- ..\Samples\CadFiles\jim.cad`
+- Result: against the current `PaletteHintStageData.json`, `jim.cad` auto-selected `st6_jck.pal`, emitted `66` native frame PNGs to `TestOutput/rendered-frames/jim/st6_jck/frames`, emitted `22` sequence folders under `.../sequences`, and wrote `jim.frames.json` with per-frame native bounds plus per-sequence canvas data.
+- Focused validation for the multi-palette CAD export succeeded with:
+- `dotnet run -- --all-palettes ..\Samples\CadFiles\rides4.cad`
+- Result: `rides4.cad` exported separate `st4_1` and `st4_2` palette folders under `TestOutput/rendered-frames/rides4`, each with `frames/`, `sequences/sequence0000/`, and a palette-local `rides4.frames.json` manifest.
+- Current unresolved CAD basenames from the exported table are:
+- `acsr`, `laser2`, `logo`, `st3_ani`, `yoni`
+- The current exported table lives at `DOS/Zyclunt/CadPaletteTable.csv`.
+
+### 2026-05-03 - Stage-specific translation-table loader
+- The string block beginning at `0x000c0391` contains `acsr`, `zyclunt.jam`, `st2_tran.pal`, `st4_tran.pal`, and `st6_tran.pal`.
+- Raw code at `0x00031feb..0x00032075` proves the game loads those three `*_tran.pal` files directly from `zyclunt.jam` as `0x10000`-byte blobs, not as 768-byte RGB palettes.
+- The selection logic is stage-major-specific:
+- `DI == 1` => `st2_tran.pal`
+- `DI == 3` => `st4_tran.pal`
+- `DI == 5` => `st6_tran.pal`
+- The loader allocates the buffer once through `0x0001406b`, stores the pointer at `0x000f6e30`, and reads exactly `0x10000` bytes through `0x000bb134`.
+- Current conclusion: the 65536-byte `*_tran.pal` files are confirmed runtime translation-table resources. They are no longer a format guess. What remains unresolved is which CAD/UI path consumes them and whether `acsr.cad` is the direct visual payload that uses them.
+
+### 2026-05-03 - Remaining non-`acsr` missing-palette CADs
+- A wider raw ASCII scan across the loaded `ZYCLUNT.LE` image (`0x00010000..0x00110000`) found no occurrences of `laser2`, `st3_ani`, `yoni`, `logo.pal`, or `logo.cad`.
+- The only `logo` string in the main executable is `logo.exe %d` at `0x000c004a`.
+- Raw code at `0x000103fd..0x00010422` formats that `logo.exe %d` string into a buffer and then passes it, together with `dos4gw`, into another routine. Current conclusion: the `logo` path in `ZYCLUNT.LE` launches an external module rather than loading `logo.cad` itself.
+- This means `logo.cad` / `logo.pal` may still be a valid pair, but that pairing is not source-backed from `ZYCLUNT.LE` alone. Proving it cleanly will require the external `logo.exe` module or another extracted asset script/data file.
+- A direct raw dump of the stage tables for major `2` (stage 3) and major `4` (stage 5) shows:
+- stage 3 tables contain `st3_1ani`, `st3_2ani`, and `laser1`
+- stage 5 tables contain `st5_ani` and `yoni'`
+- stage tables do not contain `laser2`, `st3_ani`, or plain `yoni`
+- Current conclusion: `laser2`, `st3_ani`, and `yoni` are not just missing from the generated JSON; they are absent from the main stage-name tables in the current binary.
+- Structural comparison against the sample CAD corpus shows:
+- `laser2.cad` is a very tight structural match for `laser1.cad` (`unk1 86 vs 85`, identical `count_5e=90`, `count_6=91`, `count_4=1`, and closely related first-frame size progression)
+- `yoni.cad` is an exact container-level twin of `yoni'.cad` (`size`, `unk1`, `raw_size`, `count_5e`, `count_6`, `count_4`, first raw offsets, and first chunk dimensions all match)
+- `st3_ani.cad` shares the 2-frame / 3-entry / 1-sequence layout used by the stage intro/screen assets (`st*_le`, `st3_1ani`, `st6_ani`), but no direct name source in `ZYCLUNT.LE` currently ties it to one specific palette set
+- These are useful family matches for extractor heuristics, but they are not the same thing as source-backed palette loads. For a strict table, the current unresolved non-`acsr` names remain `laser2`, `logo`, `st3_ani`, and `yoni`.
+
+### 2026-05-03 - Stage coverage across the full CAD set
+- The new `Samples/CadFiles` directory currently contains `104` CAD files for reference/testing.
+- The recovered stage tables alone cover `88 / 104` of those CAD basenames.
+- This means the scalable path for a "table for them all" is:
+- generate stage-derived CAD -> palette candidates from the binary once
+- add small manual overlays for non-stage literal palette loads
+- export the result as CSV for review and testing
+- Example stage-backed sample corrections from the generated table:
+- `jim` => `st4_1.pal`, `st4_2.pal`, `st6_jck.pal`
+- `pred` => `st3_boss.pal`, `st3_k.pal`, `st3_z.pal`, `st6_b4.pal`, `st6_p.pal`
+- `1up` remains intentionally multi-valued because it appears across many stage subtables.
+
+### 2026-05-03 - Non-stage palette path for `title`, `ending`, and `endroll`
+- The earlier assumption about unresolved non-stage palettes is no longer true for `title` and `ending`.
+- Raw code at `0x00032c22` does:
+- `EDX = 0x000c03f6` => `"title.pal"`
+- `EAX = 0x000c03d6` => `"zyclunt.jam"`
+- `call 0x0002bfa7`
+- then reads exactly `0x300` bytes into `ESP + 0x300` via `0x000bb134`, closes the file via `0x000bb30f`, and only then loads `title.cad` via `0x0002c1cc` at `0x00032d2a`.
+- The surrounding loop then derives the active title palette from that 0x300-byte base palette, including a special case for one palette index and a brightness add/clamp using `word [0x000de446]`.
+- Raw code at `0x00035c76` does:
+- `EDX = 0x000c044d` => `"ending.pal"`
+- `EAX = 0x000c0413` => `"zyclunt.jam"`
+- `call 0x0002bfa7`
+- then reads exactly `0x300` bytes into `0x000f7498` via `0x000bb134`, closes the file via `0x000bb30f`, and then loads `ending.cad` at `0x00035cc9` followed by `endroll.cad` at `0x00035d02`.
+- Later code at `0x00035d52` iterates all `0x300` palette bytes in `0x000f7498`, scales them by a runtime factor, and republishes the scaled result through `0x000e1370`. This is a palette fade/brightness path, not just a one-off load.
+- This proves that `ending.cad` and `endroll.cad` share the same `ending.pal` setup in that sequence.
+- Sample validation succeeded with the newly added extracted raw chunks and the palette files already present in `Samples/PalFiles`:
+- `dotnet run -- --decode-chunks ..\TestOutput\decoded-title --palette ..\Samples\PalFiles\title.pal ..\TestOutput\raw-chunks-all\title_off000000_290x88.bin`
+- `dotnet run -- --decode-chunks ..\TestOutput\decoded-ending --palette ..\Samples\PalFiles\ending.pal ..\TestOutput\raw-chunks-all\ending_off000000_320x60.bin ..\TestOutput\raw-chunks-all\ending_off000B07_320x60.bin`
+- Results:
+- `title_off000000_290x88.bin` decoded as `290x88`, consumed `7933/7934` bytes, used `25` nonzero palette indices, and produced `decoded-title/title_off000000_290x88.png`.
+- `ending_off000000_320x60.bin` decoded as `320x60`, consumed `2822/2823` bytes, used `6` nonzero palette indices, and produced `decoded-ending/ending_off000000_320x60.png`.
+- `ending_off000B07_320x60.bin` decoded as `320x60`, consumed `2840/2841` bytes, used `6` nonzero palette indices, and produced `decoded-ending/ending_off000B07_320x60.png`.
+
+### 2026-05-03 - Non-stage palette path for `sclear` and `sou`
+- Raw code at `0x000374c2` does:
+- `EDX = 0x000c0488` => `"sclear.pal"`
+- `EAX = 0x000c0493` => `"zyclunt.jam"`
+- `call 0x0002bfa7`
+- on failure, it falls back to `0x000bb776` with `EAX = "sclear.pal"` and `EDX = "rb"`
+- then reads exactly `0x300` bytes into `ESP` via `0x000bb134`, closes the file via `0x000bb30f`, and keeps processing in the same routine.
+- That routine then loads:
+- `sclear.cad` at `0x000375a2`
+- `sou.cad` at `0x000375db`
+- This proves that `sclear.cad` uses `sclear.pal`, and `sou.cad` shares that same `sclear.pal` setup in the same sequence.
 
 ### 2026-05-03 - 6-byte CAD entries are countdown timers with sentinel control entries
 - Multiple runtime consumers now show the same pattern around live object field `obj + 0x0a`, including `0x00041a70`, `0x00060d16`, and `0x0006509a`.
@@ -244,11 +360,13 @@
 - Assumption: the 0x5e-byte records read by `0x0002c1cc` are CAD object/frame descriptors; `+0x00/+0x02` are now proven draw-anchor offsets and late fields at `0x4c..0x5a` have strong draw-path semantics, but the remaining early fields are still unresolved.
 - Assumption: the 2-byte `unk1` field after `aux_flag` is a logical object/frame/group count or similar high-level CAD descriptor, but the loader itself does not use it.
 - Assumption: sentinel entry `dword == -1` is a high-level sequence/state transition marker, but the exact gameplay-level interpretation is still caller-specific and not yet generalized.
-- Assumption: the decoded raw chunk bytes are palette indices into an external palette source, but the exact palette source and per-scene palette selection logic are still unresolved.
+- Assumption: the remaining unmatched non-stage CADs after the current exported table, such as `acsr`, `logo`, the `st*_le` files, and `yoni`, still need a separate palette-source investigation.
 - Assumption: some important file-handling code is present but mis-bounded in Ghidra because of Borland-generated prologues/thunks; raw bytes are currently more trustworthy than the decompiler alone in these regions.
 
 ### Next checks
-- Replace the debug palette in the standalone decoder with the game's real palette source for each scene or asset class.
+- Identify the non-stage palette path used by the remaining unmatched exported-table entries: `acsr`, `laser2`, `logo`, `st1_le`, `st2_le`, `st3_ani`, `st3_le`, `st4_le`, `st5_le`, `st6_le`, and `yoni`.
+- Follow the `acsr` path first: its nearby string block contains `st2_tran.pal`, `st4_tran.pal`, and `st6_tran.pal`, which makes it a strong lead for the 65536-byte translation-table branch.
+- Classify the 65536-byte `*_tran.pal` / `*t.pal` files and determine how they interact with the 768-byte VGA palettes.
 - Continue decoding the unresolved early `0x5e` fields beyond the now-proven anchor offsets at `+0x00/+0x02`.
 - Classify the remaining 6-byte sentinel/control behavior, especially the generalized meaning of `dword == -1` entries across different callers.
 - Find the writer that initializes the startup basename table copied from `0x00100010`, or otherwise recover that table from a neighboring caller path.
