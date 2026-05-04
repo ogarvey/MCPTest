@@ -1,0 +1,62 @@
+- `FUN_0005cb3f` is Borland stack-probe code, not Forgotten Saga asset logic.
+- Real `.spb` / `.mob` archive bodies currently traced: `0001afde` open/init, `0001b08d` close, `0001b2fe` find by name, `0001b0ce` fetch subresource.
+- Sample archive header facts: fixed header `0x408` bytes, `dword@0x404` high word = entry count, low word is archive-specific (`0x0053`, `0x008B`, `0x009F`, `0x00B7`, `0x00FF` seen in SPB), entry records are `36` bytes.
+- Type codes observed: `.spb` = `0x2711`, `.mob` = `0x2712`.
+- Verified on sampled `.spb` blocks: `u32 outerSize`, `u16 subCount`, `u32 subOffsets[]`, then `u32 payloadSize + payload` at each subresource offset.
+- Verified `.spb` payload header shape: `u32 width`, `u32 height`, `u32 dataStart`, `u32 rowMetadata[height]`, with `dataStart = 12 + height*4` in sampled MAGIC and FACE payloads.
+- Confirmed decode path: `diskres.spb` wrapper `00033512` -> dispatcher `0001105c` with `ECX=0` -> mode-0 decoder `00010243`.
+- `rowMetadata[row]` is self-relative: row stream starts at `&rowMetadata[row] + rowMetadata[row]`.
+- Mode-0 SPB opcodes are source-backed: `0x80..0xFF` literal run, `0x40..0x7F` transparent skip, `0x00` row end.
+- The decoded payload is 8-bit indexed pixel data; palette selection is external to the SPB payload itself.
+- Sample-backed palette finding: header palette aligns best at `0x06` as `255` `RGBX` entries; decoded sample corpus uses indices up to `254` and never `255`.
+- The bytes at `0x02..0x05` and `0x402..0x403` vary by archive and remain unresolved.
+- MOB top-level records are `40` bytes, not `36`: `name[32] + metadataOffset + dataOffset`.
+- Binary-side MOB open/init is `00013e0c`: it reads `word@0x406` as entry count, allocates `entryCount * 40`, and loads the top-level table into `0x0bb88c`.
+- MOB region fetchers are source-backed: `00014022` uses top-level `+0x20` (`metadataOffset`), `00014094` uses top-level `+0x24` (`dataOffset`).
+- MOB `metadataOffset` regions are self-describing blocks: `u32 outerSize`, `u16 recordCount`, then `recordCount * (name[32] + u32 relOffset)` and record payloads.
+- MOB `dataOffset` regions are also self-describing blocks: `u32 outerSize`, `u16 itemCount`, `u32 itemOffsets[itemCount]`, then `u32 payloadSize + payload` per item.
+- MOB metadata record payloads are now partly source-backed: `u16 elementCount`, `u16 unknown`, then `elementCount * 20` bytes.
+- Runtime code groups MOB metadata elements by the word at element offset `+6`, then uses that grouped value as the data-item index into the `dataOffset` region.
+- `00013f54` is a metadata-record accessor inside a loaded metadata region, not a top-level metadataOffset accessor.
+- Runtime-backed MISSILE placement split: `000202ed` and `000203de` use `(currentWord1 - firstWord1, currentWord2 - firstWord2)` for record-sequence playback, while `000204bd` uses `(currentWord1 - firstWord1, currentWord2 - firstWord2 - currentItemHeight)` for explicit-element selection.
+- MOB metadata placement words `1` and `2` must be read as signed 16-bit values, not unsigned. `OBJECT.MOB` entry 428 record `ANI_0` proved this: unsigned X spans `4..65535`, signed X spans `-14..745`.
+- `OBJECT.MOB` first-four-entry check: entries 0 and 1 have one metadata record plus three data items; entries 2 and 3 have zero metadata records and one data item each. That zero-metadata/single-item shape also appears at entry 86, so it is not a reliable "mask" marker by itself.
+- The suspected `OBJECT.MOB` entries 2 and 3 are also multi-color decoded sprites (`11` and `21` palette indices used), and their names decode as normal objects (`의자`, `꽃병`). Current conclusion: no metadata-only mask discriminator yet.
+- Runtime `OBJECT.MOB` consumer traced so far: `0x1d49c` opens `obj\object.mob`, `0x1d738` resolves per-entry metadata/data and placed bounds, and `0x2f06f` later walks the object table to stamp an 8x8 occupancy/collision map via `0x2f1cb`. No traced branch classifies entries as masks.
+- `0x13e0c` caches only archive handle/count/entry table for MOBs; no header-palette state is exposed in the traced `OBJECT.MOB` path. This makes wrong-palette handling plausible.
+- `OBJECT.MOB` entry 74 (`봉화대-커스`) uses palette indices `21`, `23..28`, and `75..79`, and those header-palette slots are all `(255,0,255)`. The magenta export is therefore consistent with using the archive header palette on a normal multi-color sprite, not with a mask payload.
+- Generic visual render path now traced: `0x2b66d` resolves a MOB item with `0x13f84`, then calls renderer dispatcher `0x1105c` with `ECX=0`. Mode `0` body `0x10243` clips and copies raw indexed bytes directly into framebuffer `0x0a0720` using row offsets at `0x0a55ba`; it does not consult MOB header palette bytes.
+- Global VGA palette upload is separate from MOB decode. `0x58693`, `0x58739`, and `0x58c85` write `0x300` bytes from working palette buffer `0x0f676c` to ports `0x3c8/0x3c9`. That working palette is derived from base buffers `0x0f646c` / `0x0f6502` by `0x58e20` / `0x58e50`, not from the currently loaded MOB archive.
+- Practical conclusion: `OBJECT.MOB` magenta exports are very likely caused by using the archive header palette in the extractor, while the game uses a separate global palette state for indexed sprite rendering.
+- `BASEPAL.PAL` is `0x432` bytes, not raw `768` bytes. Its `0x300` bytes starting at file offset `0x06` exactly match the embedded header palette bytes in `OBJECT.MOB`, `MAIN.MOB`, and `EFFECT.MOB`; it is shared base-palette evidence, not a distinct fix for `OBJECT.MOB`.
+- `Scordato --palette` now accepts both raw `768`-byte VGA palettes and `0x2711/0x2712` files with embedded header RGBX palettes, so `--palette BASEPAL.PAL` works directly. Validation run on `OBJECT.MOB` completed successfully and recorded `embedded header RGBX palette from BASEPAL.PAL` in the manifest.
+- `0x5d778` is memcpy with `dest = EAX`, `source = EDX`, `count = EBX`.
+- `0x224cb` is a raw `0x300`-byte VGA DAC uploader. The proven direct raw palette path is `tit.pal -> 0x5a804 -> 0x224cb`.
+- `0x1afd4` loads a named `.spb` header: full `0x408` header into `0x0c4c64`, top-level entry table into `0x0c5070`, optional full-header copy to a caller buffer.
+- `0x3351f` wraps `diskres.spb`: it loads the header through `0x1afd4`, copies header bytes `0x06..0x405` (`0x400` bytes, including the embedded palette block and trailing dword) to a caller buffer, then resolves the requested entry. `0x17f99` uses that wrapper immediately before `0x1105c`.
+- Practical palette rule now backed by runtime tracing: gameplay-style indexed draws take their palette context from the active scene/resource `.spb` header tail, not from `OBJECT.MOB` or `BASEPAL.PAL`. The exact gameplay DAC upload site is still unresolved, but extractor-side palette selection should follow the active scene/resource header.
+- World/object startup is on a different branch: `0x18ee0` loads `static.dat` into `0x0c50d8` / `0x0c50d4`, and the world/object state machine at `0x1cbe4` later consumes that state.
+- The earlier `0x1ab52 -> 0x1b314` world-loader interpretation was a mis-decoded raw byte stream and is retracted.
+- In corrected world/object state `3`, when `0x0c50e0` is null the code loads `EAX = [0x0c5428]` and `EDX = [0x0c5430]`, calls `0x21325`, then calls `0x1e82a` and stores the result in `0x0c50e0`.
+- Corrected `0x0c542c` anchor: around `0x1cbd3`, the state machine checks `0x0c542c`; if it is null it calls `0x1ab48(0)` and stores the return value in `0x0c50e8`, and if both `0x0c542c` and `0x0c50e8` are non-null it calls `0x1cced(EAX = [0x0c50e8], EDX = [0x0c542c])` before `0x1dc34`.
+- `0x1cced` is placement/list logic, not palette logic: it walks a linked chain via `+0x23c`, clears bit `0x04` at `+0x1c0`, and rebases node coordinates at `+0x1d0` / `+0x1d4` using signed values from the active object at `+0x22` / `+0x24`.
+- The live `map\forga.fam` file still disproves the old easy header model (`0x3176` at file offset `0`). The exact world-side container/record behind the gameplay branch remains unresolved.
+- Runtime-backed `FORGA.FAM` layout is two-table, not one-table: first count `291` at `0x0004`, first table `0x0006..0x1235`, second header dword `0x00b85aa4` + count `105` at `0x1236`, second table `0x123C..0x18CB`.
+- Both FAM tables are `char name[12] + u32 dataOffset`; `0x1af87` is the shared `strcmp` lookup helper over those `16`-byte records.
+- `0x1ae15` is the scene loader: first-table lookup by requested area name, seek to `dataOffset + 4`, read embedded `12`-byte name + header fields, decompress first blob, then use the embedded name to look up and load a second-table blob.
+- Shared FAM decompression path: `0x59c24` peeks a dword and rewinds, `0x59e9e` is a 4 KB window LZ-style stream with a leading decompressed-size dword.
+- First-table records: leading dword matches `payloadSpan - 0x2C`; dword at `0x2C` is decompressed size; sampled records satisfy `field10 * field12 * 5 == decompressedSize`.
+- Second-table records: leading dword matches `payloadSpan - 4`; dword at `+4` is decompressed size; runtime splits the decoded buffer at `size - 0x10400` and `size - 0x10000`.
+- `AREA02` second-buffer sample: the `0x400` bytes at `size - 0x10400` decode cleanly as RGBX-like palette quads, followed by a separate `0x10000`-byte indexed-data region. Exact first-buffer cell semantics are still unresolved.
+- `Scordato` now emits `.fam` manifests with both table counts, shared LZ metadata, first-table `field10 * field12 * 5` checks, and second-buffer tail offsets under `TestOutput\Scordato\FORGA`.
+- Current split: `diskres.spb`/portrait-style wrappers are real but appear separate from the `static.dat`-driven world/object branch. The corrected `0x1cbd3` / `0x1cced` branch is placement-only, so the gameplay palette answer still lies outside both that path and the retracted `0x1ab52` story.
+- Record choice happens in higher-level owner/state code before playback helpers run. Traced `13f54` callers pass explicit record indices, including `0`, `1`, `2`, and `4`.
+- The old file-shape selector heuristic is retired. `Scordato` now treats explicit-element Y-corrected placement as the default primary MOB export. Optional sequence-relative exports are still available behind `--emit-sequence-relative`, and oversized strip canvases are skipped instead of crashing the run.
+- Current `Scordato` defaults are lower-clutter: no raw `.bin` dumps, no strip PNGs, and explicit-aligned MOB frames are primary under `metadata/frames/`.
+- Opt-in switches: `--emit-binaries` restores raw dumps and indexed/mask binaries, `--emit-strips` restores strip PNGs, and `--emit-sequence-relative` adds the older sequence-relative alignment under `metadata/frames-sequence/` and `*.sequence.png`.
+- Runtime MOB data-item layout starts at the per-item `u32 payloadSize`; after that, the item contains a fixed `0xA8` bytes plus a variable tail whose size is stored at file payload offset `0xA0` (`runtime +0xA4`).
+- Sample-backed MISSILE item sprite decode: width = `u16@file+0x04 + 1`, height = `u16@file+0x06 + 1`, `u32@file+0xA4` matches width, `u32@file+0xA8` matches height, row table starts at `0xB0`, and row streams use the same literal/skip/end opcodes as SPB mode 0.
+- `Scordato` now exports per-item MISSILE sprite PNGs, runtime-relative named metadata strip PNGs, and aligned per-sequence frame canvases when the referenced item list resolves completely.
+- `Scordato` now emits MOB metadata/data regions and the corrected named record structure into `TestOutput/Scordato`.
+- CP949 decoding is useful for entry names; `MAGIC.SPB` names decode cleanly to Korean text.
+- `.mob` inner semantics are only partly solved: the metadata/data region structure and part of the metadata-to-data bridge are source-backed, but the full meaning of each `20` byte metadata element and the fixed `0xA8` data-item header is still unresolved.
