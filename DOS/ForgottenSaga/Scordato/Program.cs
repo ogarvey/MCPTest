@@ -564,19 +564,19 @@ static void WriteFamInspectionOutput(
 
 			if (entry.Manifest.RuntimePaletteOffset is { } paletteOffset
 				&& entry.Manifest.RuntimePaletteLength is { } paletteLength
-				&& entry.Manifest.RuntimeTileOffset is { } tileOffset
-				&& entry.Manifest.RuntimeTileLength is { } tileLength)
+				&& entry.Manifest.RuntimeLookupTableOffset is { } lookupTableOffset
+				&& entry.Manifest.RuntimeLookupTableLength is { } lookupTableLength)
 			{
 				var paletteFileName = $"{filePrefix}_{entry.Manifest.Index:D3}_{SanitizeFileComponent(entry.Manifest.DecodedName)}.tail-palette.rgbx.bin";
-				var tileFileName = $"{filePrefix}_{entry.Manifest.Index:D3}_{SanitizeFileComponent(entry.Manifest.DecodedName)}.tail-tiles.bin";
+				var lookupTableFileName = $"{filePrefix}_{entry.Manifest.Index:D3}_{SanitizeFileComponent(entry.Manifest.DecodedName)}.tail-lookup-table.bin";
 				File.WriteAllBytes(
 					Path.Combine(absoluteDir, paletteFileName),
 					entry.DecompressedPayload.AsSpan(paletteOffset, paletteLength).ToArray());
 				File.WriteAllBytes(
-					Path.Combine(absoluteDir, tileFileName),
-					entry.DecompressedPayload.AsSpan(tileOffset, tileLength).ToArray());
+					Path.Combine(absoluteDir, lookupTableFileName),
+					entry.DecompressedPayload.AsSpan(lookupTableOffset, lookupTableLength).ToArray());
 				entry.Manifest.RuntimePaletteOutputFile = Path.Combine(relativeDir, paletteFileName);
-				entry.Manifest.RuntimeTileOutputFile = Path.Combine(relativeDir, tileFileName);
+				entry.Manifest.RuntimeLookupTableOutputFile = Path.Combine(relativeDir, lookupTableFileName);
 			}
 		}
 	}
@@ -610,7 +610,7 @@ static void WriteFamSceneProbeOutputs(
 
 	foreach (var firstEntry in inspection.Entries.Where(entry => entry.Manifest.TableName == "first" && requested.Contains(entry.Manifest.DecodedName)))
 	{
-		firstEntry.Manifest.ProbeMode = "flat-width-height-planes";
+		firstEntry.Manifest.ProbeMode = "loader-derived-attr-base-overlay-scene";
 		var resourceName = firstEntry.Manifest.EmbeddedName ?? firstEntry.Manifest.DecodedName;
 		firstEntry.Manifest.ProbeResourceName = resourceName;
 
@@ -625,7 +625,15 @@ static void WriteFamSceneProbeOutputs(
 		var probeDir = Path.Combine(probesRoot, probeDirName);
 		ResetDirectory(probeDir);
 
-		if (!FamSceneProbeWriter.TryWriteFlatPlaneProbe(probeDir, firstEntry, secondEntry, out var planeFiles, out var error))
+		if (!FamSceneProbeWriter.TryWriteSceneDebugProbe(
+			probeDir,
+			firstEntry,
+			secondEntry,
+			out var planeFiles,
+			out var palettePreviewFile,
+			out var lookupTablePreviewFile,
+			out var probeNotes,
+			out var error))
 		{
 			firstEntry.Manifest.ProbeError = error;
 			continue;
@@ -633,6 +641,17 @@ static void WriteFamSceneProbeOutputs(
 
 		firstEntry.Manifest.ProbeOutputDirectory = Path.Combine("scene_probes", probeDirName);
 		firstEntry.Manifest.ProbePlaneFiles.AddRange(planeFiles.Select(fileName => Path.Combine("scene_probes", probeDirName, fileName)));
+		if (palettePreviewFile is not null)
+		{
+			firstEntry.Manifest.ProbePalettePreviewFile = Path.Combine("scene_probes", probeDirName, palettePreviewFile);
+		}
+
+		if (lookupTablePreviewFile is not null)
+		{
+			firstEntry.Manifest.ProbeLookupTablePreviewFile = Path.Combine("scene_probes", probeDirName, lookupTablePreviewFile);
+		}
+
+		firstEntry.Manifest.ProbeNotes.AddRange(probeNotes);
 	}
 }
 
@@ -1188,7 +1207,7 @@ static class FamInspector
 	private const int FirstChunkLzOffset = 0x2C;
 	private const int SecondChunkLzOffset = 0x04;
 	private const int SecondaryPaletteTailLength = 0x400;
-	private const int SecondaryTileTailLength = 0x10000;
+	private const int SecondaryLookupTableLength = 0x10000;
 	private static readonly Encoding AsciiEncoding = Encoding.ASCII;
 
 	public static FamInspection Inspect(string path, bool retainDecompressedPayloads = false)
@@ -1404,13 +1423,13 @@ static class FamInspector
 
 		if (manifest.LzDecodeSucceeded == true && manifest.DecompressedSize is { } decompressedSize)
 		{
-			var tailTotalLength = SecondaryPaletteTailLength + SecondaryTileTailLength;
+			var tailTotalLength = SecondaryPaletteTailLength + SecondaryLookupTableLength;
 			if (decompressedSize >= tailTotalLength)
 			{
 				manifest.RuntimePaletteOffset = (int)decompressedSize - tailTotalLength;
 				manifest.RuntimePaletteLength = SecondaryPaletteTailLength;
-				manifest.RuntimeTileOffset = (int)decompressedSize - SecondaryTileTailLength;
-				manifest.RuntimeTileLength = SecondaryTileTailLength;
+				manifest.RuntimeLookupTableOffset = (int)decompressedSize - SecondaryLookupTableLength;
+				manifest.RuntimeLookupTableLength = SecondaryLookupTableLength;
 			}
 		}
 	}
@@ -1638,17 +1657,27 @@ sealed class AppOptions
 
 static class FamSceneProbeWriter
 {
-	private const int TileSideLength = 16;
+	private const int RuntimeHeightTrim = 0x28;
+	private const int AttributePlaneLeadRows = 20;
+	private const int TilePlaneLeadRows = 40;
+	private const int TileSideLength = 8;
 	private const int BytesPerTile = TileSideLength * TileSideLength;
+	private const int LookupTableSideLength = 256;
 
-	public static bool TryWriteFlatPlaneProbe(
+	public static bool TryWriteSceneDebugProbe(
 		string outputDir,
 		FamEntryPayload firstEntry,
 		FamEntryPayload secondEntry,
 		out List<string> planeFiles,
+		out string? palettePreviewFile,
+		out string? lookupTablePreviewFile,
+		out List<string> probeNotes,
 		out string? error)
 	{
 		planeFiles = new List<string>();
+		palettePreviewFile = null;
+		lookupTablePreviewFile = null;
+		probeNotes = new List<string>();
 		error = null;
 
 		if (firstEntry.DecompressedPayload is null)
@@ -1663,32 +1692,72 @@ static class FamSceneProbeWriter
 			return false;
 		}
 
-		if (firstEntry.Manifest.Field10 is not { } width || firstEntry.Manifest.Field12 is not { } height)
+		if (firstEntry.Manifest.Field10 is not { } width || firstEntry.Manifest.Field12 is not { } headerHeight)
 		{
 			error = $"{firstEntry.Manifest.DecodedName} is missing the first-table dimensions needed for a scene probe.";
 			return false;
 		}
 
-		var cellCount64 = (long)width * height;
-		if (cellCount64 > int.MaxValue)
+		var firstPayloadLength64 = (long)width * headerHeight * 5;
+		if (firstPayloadLength64 > int.MaxValue)
 		{
 			error = $"{firstEntry.Manifest.DecodedName} is too large to probe in memory.";
 			return false;
 		}
 
-		var cellCount = (int)cellCount64;
-		if (firstEntry.DecompressedPayload.Length != cellCount * 5)
+		if (firstEntry.DecompressedPayload.Length != firstPayloadLength64)
 		{
-			error = $"{firstEntry.Manifest.DecodedName} primary payload is {firstEntry.DecompressedPayload.Length} bytes; expected {cellCount * 5} for five flat planes.";
+			error = $"{firstEntry.Manifest.DecodedName} primary payload is {firstEntry.DecompressedPayload.Length} bytes; expected {firstPayloadLength64} from the loader-backed width * height * 5 rule.";
+			return false;
+		}
+
+		var runtimeHeight = headerHeight - RuntimeHeightTrim;
+		if (runtimeHeight <= 0)
+		{
+			error = $"{firstEntry.Manifest.DecodedName} runtime height becomes {runtimeHeight} after the loader's 0x28-row trim.";
+			return false;
+		}
+
+		var runtimeCellCount64 = (long)width * runtimeHeight;
+		if (runtimeCellCount64 > int.MaxValue)
+		{
+			error = $"{firstEntry.Manifest.DecodedName} runtime tilemap is too large to probe in memory.";
+			return false;
+		}
+
+		var runtimeCellCount = (int)runtimeCellCount64;
+		var attributeOffset = checked(width * AttributePlaneLeadRows);
+		var baseTileOffset = checked((width * headerHeight) + (width * TilePlaneLeadRows));
+		var overlayTileOffset = checked((width * headerHeight * 3) + (width * TilePlaneLeadRows));
+		var baseTileByteCount = checked(runtimeCellCount * 2);
+		var overlayTileByteCount = checked(runtimeCellCount * 2);
+
+		if (attributeOffset + runtimeCellCount > firstEntry.DecompressedPayload.Length
+			|| baseTileOffset + baseTileByteCount > firstEntry.DecompressedPayload.Length
+			|| overlayTileOffset + overlayTileByteCount > firstEntry.DecompressedPayload.Length)
+		{
+			error = $"{firstEntry.Manifest.DecodedName} loader-derived scene slices extend beyond the decoded primary payload.";
 			return false;
 		}
 
 		if (secondEntry.Manifest.RuntimePaletteOffset is not { } paletteOffset
 			|| secondEntry.Manifest.RuntimePaletteLength is not { } paletteLength
-			|| secondEntry.Manifest.RuntimeTileOffset is not { } tileOffset
-			|| secondEntry.Manifest.RuntimeTileLength is not { } tileLength)
+			|| secondEntry.Manifest.RuntimeLookupTableOffset is not { } lookupTableOffset
+			|| secondEntry.Manifest.RuntimeLookupTableLength is not { } lookupTableLength)
 		{
-			error = $"{secondEntry.Manifest.DecodedName} is missing the second-buffer palette/tile tail offsets required for a scene probe.";
+			error = $"{secondEntry.Manifest.DecodedName} is missing the second-buffer palette/lookup-table tail offsets required for a scene probe.";
+			return false;
+		}
+
+		if (paletteLength % 4 != 0)
+		{
+			error = $"{secondEntry.Manifest.DecodedName} palette tail length {paletteLength} is not a multiple of 4-byte RGBX entries.";
+			return false;
+		}
+
+		if (lookupTableLength != LookupTableSideLength * LookupTableSideLength)
+		{
+			error = $"{secondEntry.Manifest.DecodedName} lookup-table tail length {lookupTableLength} does not match the expected {LookupTableSideLength * LookupTableSideLength} bytes.";
 			return false;
 		}
 
@@ -1697,31 +1766,100 @@ static class FamSceneProbeWriter
 			0,
 			paletteLength / 4,
 			$"FORGA.FAM probe palette from {secondEntry.Manifest.DecodedName}");
-		var tileBytes = secondEntry.DecompressedPayload.AsSpan(tileOffset, tileLength).ToArray();
-		var tileCount = tileBytes.Length / BytesPerTile;
-
-		if (tileCount == 0 || tileBytes.Length % BytesPerTile != 0)
+		var lookupTableBytes = secondEntry.DecompressedPayload.AsSpan(lookupTableOffset, lookupTableLength).ToArray();
+		var tileBankLength = paletteOffset;
+		if (tileBankLength <= 0 || tileBankLength % BytesPerTile != 0)
 		{
-			error = $"{secondEntry.Manifest.DecodedName} tile tail is not a clean multiple of {BytesPerTile} bytes.";
+			error = $"{secondEntry.Manifest.DecodedName} tile bank length {tileBankLength} is not a clean multiple of {BytesPerTile}-byte 8x8 tiles.";
 			return false;
 		}
 
-		for (var planeIndex = 0; planeIndex < 5; planeIndex++)
-		{
-			var planeData = firstEntry.DecompressedPayload.AsSpan(planeIndex * cellCount, cellCount).ToArray();
-			var fileName = $"plane_{planeIndex}.png";
-			ImageWriter.WriteFamTilePlanePng(
-				Path.Combine(outputDir, fileName),
-				planeData,
-				width,
-				height,
-				tileBytes,
-				tileCount,
-				palette);
-			planeFiles.Add(fileName);
-		}
+		var attributeValues = firstEntry.DecompressedPayload.AsSpan(attributeOffset, runtimeCellCount).ToArray();
+		var baseTileIndices = ReadUInt16Array(firstEntry.DecompressedPayload, baseTileOffset, runtimeCellCount);
+		var overlayTileIndices = ReadUInt16Array(firstEntry.DecompressedPayload, overlayTileOffset, runtimeCellCount);
+		var tileBankBytes = secondEntry.DecompressedPayload.AsSpan(0, tileBankLength).ToArray();
+		var attributeLowNibble = attributeValues.Select(static value => (byte)(value & 0x0F)).ToArray();
+		var attributeHighBitMask = attributeValues.Select(static value => (byte)((value & 0x80) != 0 ? 0xFF : 0x00)).ToArray();
+		var translationCellCount = attributeValues.Count(static value => (value & 0x80) != 0);
+
+		var attributeFileName = "attribute_low_nibble.png";
+		ImageWriter.WriteFamPlaneValueMapPng(
+			Path.Combine(outputDir, attributeFileName),
+			attributeLowNibble,
+			width,
+			runtimeHeight);
+		planeFiles.Add(attributeFileName);
+
+		var translationMaskFileName = "attribute_high_bit_mask.png";
+		ImageWriter.WriteFamPlaneValueMapPng(
+			Path.Combine(outputDir, translationMaskFileName),
+			attributeHighBitMask,
+			width,
+			runtimeHeight);
+		planeFiles.Add(translationMaskFileName);
+
+		var baseTileFileName = "base_tile_indices.png";
+		ImageWriter.WriteFamU16ValueMapPng(
+			Path.Combine(outputDir, baseTileFileName),
+			baseTileIndices,
+			width,
+			runtimeHeight);
+		planeFiles.Add(baseTileFileName);
+
+		var overlayTileFileName = "overlay_tile_indices.png";
+		ImageWriter.WriteFamU16ValueMapPng(
+			Path.Combine(outputDir, overlayTileFileName),
+			overlayTileIndices,
+			width,
+			runtimeHeight);
+		planeFiles.Add(overlayTileFileName);
+
+		var compositeFileName = translationCellCount == 0
+			? "scene_composite.png"
+			: "scene_composite_pretranslation.png";
+		ImageWriter.WriteFamSceneCompositePng(
+			Path.Combine(outputDir, compositeFileName),
+			baseTileIndices,
+			overlayTileIndices,
+			width,
+			runtimeHeight,
+			tileBankBytes,
+			palette);
+		planeFiles.Add(compositeFileName);
+
+		palettePreviewFile = "secondary_palette_preview.png";
+		ImageWriter.WriteFamPalettePreviewPng(
+			Path.Combine(outputDir, palettePreviewFile),
+			palette,
+			paletteLength / 4);
+
+		lookupTablePreviewFile = "secondary_lookup_table.png";
+		ImageWriter.WriteFamLookupTablePng(
+			Path.Combine(outputDir, lookupTablePreviewFile),
+			lookupTableBytes);
+
+		probeNotes.Add($"Loader-backed first-buffer layout: attribute bytes @ +0x{attributeOffset:X}, base tile indices @ +0x{baseTileOffset:X}, overlay tile indices @ +0x{overlayTileOffset:X}; runtime map size is {width}x{runtimeHeight} after the loader trims 0x28 rows from the header height {headerHeight}.");
+		probeNotes.Add($"Secondary resource begins with {tileBankLength / BytesPerTile} 8x8 tiles ({tileBankLength} bytes) before the RGBX palette tail.");
+		probeNotes.Add($"The scene composite follows the runtime base-tile plus transparent-overlay draw path. Cells with attribute bit 0x80 would need an additional translation step through the engine's color table.");
+		probeNotes.Add(translationCellCount == 0
+			? "AREA02-style validation: no attribute byte sets bit 0x80, so the emitted scene composite does not need the unresolved translation-table step."
+			: $"Translation-table follow-up still required: {translationCellCount} cells set attribute bit 0x80.");
+		probeNotes.Add($"Secondary resource offset 0x{paletteOffset:X} contributes {paletteLength / 4} RGBX palette entries.");
+		probeNotes.Add($"Secondary resource offset 0x{lookupTableOffset:X} contributes a 256x256 lookup table; runtime tracing shows the engine consumes it as a remap table, not a tile bank.");
 
 		return true;
+	}
+
+	private static ushort[] ReadUInt16Array(byte[] data, int offset, int elementCount)
+	{
+		var values = new ushort[elementCount];
+
+		for (var index = 0; index < elementCount; index++)
+		{
+			values[index] = BitConverter.ToUInt16(data, offset + (index * 2));
+		}
+
+		return values;
 	}
 }
 
@@ -2142,8 +2280,12 @@ static class ImageWriter
 	private const long MaxImageSharpBufferLength = 4L * 1024 * 1024 * 1024;
 	private const int BytesPerRgba32Pixel = 4;
 	private const long MaxStripPixelCount = 134_217_728;
-	private const int FamTileSideLength = 16;
-	private const int FamTilePixelCount = FamTileSideLength * FamTileSideLength;
+	private const int FamProbeCellScale = 4;
+	private const int FamPalettePreviewColumns = 16;
+	private const int FamPalettePreviewSwatchSize = 24;
+	private const int FamLookupTableSideLength = 256;
+	private const int FamSceneTileSideLength = 8;
+	private const int FamSceneBytesPerTile = FamSceneTileSideLength * FamSceneTileSideLength;
 
 	public static void WritePng(string path, DecodedSpbImage image, IndexedPalette palette)
 	{
@@ -2201,66 +2343,257 @@ static class ImageWriter
 		output.Save(path);
 	}
 
-	public static void WriteFamTilePlanePng(
+	public static void WriteFamPlaneValueMapPng(
 		string path,
-		byte[] tileIndices,
+		byte[] planeValues,
 		int width,
-		int height,
-		byte[] tileBytes,
-		int tileCount,
-		IndexedPalette palette)
+		int height)
 	{
-		var outputWidth = (long)width * FamTileSideLength;
-		var outputHeight = (long)height * FamTileSideLength;
+		var outputWidth = (long)width * FamProbeCellScale;
+		var outputHeight = (long)height * FamProbeCellScale;
 		ValidateCanvasDimensions(outputWidth, outputHeight, path, enforceStripLimit: false);
 
 		using var output = new Image<Rgba32>((int)outputWidth, (int)outputHeight);
-		var cachedTiles = new Rgba32[tileCount][];
+		var (minValue, maxValue) = ComputeNonZeroRange(planeValues);
 
-		for (var cellIndex = 0; cellIndex < tileIndices.Length; cellIndex++)
+		for (var cellIndex = 0; cellIndex < planeValues.Length; cellIndex++)
 		{
-			var tileIndex = tileIndices[cellIndex];
-			if (tileIndex == 0 || tileIndex >= tileCount)
+			var color = BuildFamPlaneDebugColor(planeValues[cellIndex], minValue, maxValue);
+			var cellX = (cellIndex % width) * FamProbeCellScale;
+			var cellY = (cellIndex / width) * FamProbeCellScale;
+			FillBlock(output, cellX, cellY, FamProbeCellScale, color);
+		}
+
+		output.Save(path);
+	}
+
+	public static void WriteFamU16ValueMapPng(
+		string path,
+		ushort[] planeValues,
+		int width,
+		int height)
+	{
+		var outputWidth = (long)width * FamProbeCellScale;
+		var outputHeight = (long)height * FamProbeCellScale;
+		ValidateCanvasDimensions(outputWidth, outputHeight, path, enforceStripLimit: false);
+
+		using var output = new Image<Rgba32>((int)outputWidth, (int)outputHeight);
+		var (minValue, maxValue) = ComputeNonZeroRange(planeValues);
+
+		for (var cellIndex = 0; cellIndex < planeValues.Length; cellIndex++)
+		{
+			var color = BuildFamPlaneDebugColor(planeValues[cellIndex], minValue, maxValue);
+			var cellX = (cellIndex % width) * FamProbeCellScale;
+			var cellY = (cellIndex / width) * FamProbeCellScale;
+			FillBlock(output, cellX, cellY, FamProbeCellScale, color);
+		}
+
+		output.Save(path);
+	}
+
+	public static void WriteFamSceneCompositePng(
+		string path,
+		ushort[] baseTileIndices,
+		ushort[] overlayTileIndices,
+		int width,
+		int height,
+		byte[] tileBankBytes,
+		IndexedPalette palette)
+	{
+		var outputWidth = (long)width * FamSceneTileSideLength;
+		var outputHeight = (long)height * FamSceneTileSideLength;
+		ValidateCanvasDimensions(outputWidth, outputHeight, path, enforceStripLimit: false);
+
+		using var output = new Image<Rgba32>((int)outputWidth, (int)outputHeight);
+		var tileCount = tileBankBytes.Length / FamSceneBytesPerTile;
+
+		for (var cellIndex = 0; cellIndex < baseTileIndices.Length; cellIndex++)
+		{
+			var cellX = (cellIndex % width) * FamSceneTileSideLength;
+			var cellY = (cellIndex / width) * FamSceneTileSideLength;
+			DrawFamTile(output, cellX, cellY, baseTileIndices[cellIndex], tileBankBytes, tileCount, palette, treat0xFFAsTransparent: false);
+
+			if (cellIndex < overlayTileIndices.Length)
 			{
-				continue;
-			}
-
-			var tile = cachedTiles[tileIndex] ??= BuildFamTile(tileBytes, tileIndex, palette);
-			var cellX = (cellIndex % width) * FamTileSideLength;
-			var cellY = (cellIndex / width) * FamTileSideLength;
-
-			for (var tileY = 0; tileY < FamTileSideLength; tileY++)
-			{
-				for (var tileX = 0; tileX < FamTileSideLength; tileX++)
-				{
-					var color = tile[(tileY * FamTileSideLength) + tileX];
-					if (color.A == 0)
-					{
-						continue;
-					}
-
-					output[cellX + tileX, cellY + tileY] = color;
-				}
+				DrawFamTile(output, cellX, cellY, overlayTileIndices[cellIndex], tileBankBytes, tileCount, palette, treat0xFFAsTransparent: true);
 			}
 		}
 
 		output.Save(path);
 	}
 
-	private static Rgba32[] BuildFamTile(byte[] tileBytes, int tileIndex, IndexedPalette palette)
+	public static void WriteFamPalettePreviewPng(string path, IndexedPalette palette, int entryCount)
 	{
-		var pixels = new Rgba32[FamTilePixelCount];
-		var tileOffset = tileIndex * FamTilePixelCount;
+		var rows = Math.Max(1, (entryCount + FamPalettePreviewColumns - 1) / FamPalettePreviewColumns);
+		var outputWidth = (long)FamPalettePreviewColumns * FamPalettePreviewSwatchSize;
+		var outputHeight = (long)rows * FamPalettePreviewSwatchSize;
+		ValidateCanvasDimensions(outputWidth, outputHeight, path, enforceStripLimit: false);
 
-		for (var pixelIndex = 0; pixelIndex < FamTilePixelCount; pixelIndex++)
+		using var output = new Image<Rgba32>((int)outputWidth, (int)outputHeight);
+
+		for (var index = 0; index < entryCount; index++)
 		{
-			var paletteIndex = tileBytes[tileOffset + pixelIndex];
-			pixels[pixelIndex] = paletteIndex == 0
-				? default
-				: palette.Colors[paletteIndex];
+			var swatchX = (index % FamPalettePreviewColumns) * FamPalettePreviewSwatchSize;
+			var swatchY = (index / FamPalettePreviewColumns) * FamPalettePreviewSwatchSize;
+			FillBlock(output, swatchX, swatchY, FamPalettePreviewSwatchSize, palette.Colors[index]);
 		}
 
-		return pixels;
+		output.Save(path);
+	}
+
+	public static void WriteFamLookupTablePng(string path, byte[] lookupTableBytes)
+	{
+		if (lookupTableBytes.Length != FamLookupTableSideLength * FamLookupTableSideLength)
+		{
+			throw new InvalidDataException($"Lookup table preview requires exactly {FamLookupTableSideLength * FamLookupTableSideLength} bytes.");
+		}
+
+		ValidateCanvasDimensions(FamLookupTableSideLength, FamLookupTableSideLength, path, enforceStripLimit: false);
+		using var output = new Image<Rgba32>(FamLookupTableSideLength, FamLookupTableSideLength);
+
+		for (var index = 0; index < lookupTableBytes.Length; index++)
+		{
+			var value = lookupTableBytes[index];
+			output[index % FamLookupTableSideLength, index / FamLookupTableSideLength] = new Rgba32(value, value, value, 0xFF);
+		}
+
+		output.Save(path);
+	}
+
+	private static (byte MinValue, byte MaxValue) ComputeNonZeroRange(byte[] values)
+	{
+		var foundNonZero = false;
+		byte minValue = byte.MaxValue;
+		byte maxValue = byte.MinValue;
+
+		foreach (var value in values)
+		{
+			if (value == 0)
+			{
+				continue;
+			}
+
+			foundNonZero = true;
+			if (value < minValue)
+			{
+				minValue = value;
+			}
+
+			if (value > maxValue)
+			{
+				maxValue = value;
+			}
+		}
+
+		return foundNonZero ? (minValue, maxValue) : ((byte)0, (byte)0);
+	}
+
+	private static (ushort MinValue, ushort MaxValue) ComputeNonZeroRange(ushort[] values)
+	{
+		var foundNonZero = false;
+		ushort minValue = ushort.MaxValue;
+		ushort maxValue = ushort.MinValue;
+
+		foreach (var value in values)
+		{
+			if (value == 0)
+			{
+				continue;
+			}
+
+			foundNonZero = true;
+			if (value < minValue)
+			{
+				minValue = value;
+			}
+
+			if (value > maxValue)
+			{
+				maxValue = value;
+			}
+		}
+
+		return foundNonZero ? (minValue, maxValue) : ((ushort)0, (ushort)0);
+	}
+
+	private static Rgba32 BuildFamPlaneDebugColor(byte value, byte minValue, byte maxValue)
+	{
+		if (value == 0)
+		{
+			return new Rgba32(0, 0, 0, 0xFF);
+		}
+
+		if (minValue == maxValue)
+		{
+			return new Rgba32(0xFF, 0xFF, 0xFF, 0xFF);
+		}
+
+		var range = Math.Max(1, maxValue - minValue);
+		var intensity = 64 + (((value - minValue) * 191) / range);
+		var channel = (byte)intensity;
+		return new Rgba32(channel, channel, channel, 0xFF);
+	}
+
+	private static Rgba32 BuildFamPlaneDebugColor(ushort value, ushort minValue, ushort maxValue)
+	{
+		if (value == 0)
+		{
+			return new Rgba32(0, 0, 0, 0xFF);
+		}
+
+		if (minValue == maxValue)
+		{
+			return new Rgba32(0xFF, 0xFF, 0xFF, 0xFF);
+		}
+
+		var range = Math.Max(1, maxValue - minValue);
+		var intensity = 64 + (((value - minValue) * 191) / range);
+		var channel = (byte)intensity;
+		return new Rgba32(channel, channel, channel, 0xFF);
+	}
+
+	private static void DrawFamTile(
+		Image<Rgba32> output,
+		int cellX,
+		int cellY,
+		ushort tileIndex,
+		byte[] tileBankBytes,
+		int tileCount,
+		IndexedPalette palette,
+		bool treat0xFFAsTransparent)
+	{
+		if (tileIndex == 0 || tileIndex > tileCount)
+		{
+			return;
+		}
+
+		var tileOffset = (tileIndex - 1) * FamSceneBytesPerTile;
+		for (var y = 0; y < FamSceneTileSideLength; y++)
+		{
+			for (var x = 0; x < FamSceneTileSideLength; x++)
+			{
+				var paletteIndex = tileBankBytes[tileOffset + (y * FamSceneTileSideLength) + x];
+				if (treat0xFFAsTransparent && paletteIndex == 0xFF)
+				{
+					continue;
+				}
+
+				output[cellX + x, cellY + y] = paletteIndex == 0xFF
+					? default
+					: palette.Colors[paletteIndex];
+			}
+		}
+	}
+
+	private static void FillBlock(Image<Rgba32> output, int startX, int startY, int blockSize, Rgba32 color)
+	{
+		for (var y = 0; y < blockSize; y++)
+		{
+			for (var x = 0; x < blockSize; x++)
+			{
+				output[startX + x, startY + y] = color;
+			}
+		}
 	}
 
 	public static void WritePlacedFramePng(
@@ -2487,16 +2820,19 @@ sealed class FamEntryManifest
 	public bool? MatchesFiveBytesPerCell { get; set; }
 	public int? RuntimePaletteOffset { get; set; }
 	public int? RuntimePaletteLength { get; set; }
-	public int? RuntimeTileOffset { get; set; }
-	public int? RuntimeTileLength { get; set; }
+	public int? RuntimeLookupTableOffset { get; set; }
+	public int? RuntimeLookupTableLength { get; set; }
 	public string? RuntimePaletteOutputFile { get; set; }
-	public string? RuntimeTileOutputFile { get; set; }
+	public string? RuntimeLookupTableOutputFile { get; set; }
 	public string? ProbeMode { get; set; }
 	public string? ProbeResourceName { get; set; }
 	public int? ProbeResourceIndex { get; set; }
 	public string? ProbeOutputDirectory { get; set; }
+	public string? ProbePalettePreviewFile { get; set; }
+	public string? ProbeLookupTablePreviewFile { get; set; }
 	public string? ProbeError { get; set; }
 	public List<string> ProbePlaneFiles { get; } = new();
+	public List<string> ProbeNotes { get; } = new();
 	public List<string> AsciiPreview { get; } = new();
 }
 
