@@ -1,6 +1,7 @@
 ﻿using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
@@ -10,16 +11,6 @@ var projectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", 
 var sampleRoot = Path.GetFullPath(Path.Combine(projectRoot, "..", "Samples"));
 var outputRoot = Path.GetFullPath(Path.Combine(projectRoot, "..", "TestOutput", "Scordato"));
 var options = ParseArguments(args);
-
-if (options.PalettePath is { } palettePath && !File.Exists(palettePath))
-{
-	Console.Error.WriteLine($"Palette file not found: {palettePath}");
-	return 1;
-}
-
-var palette = options.PalettePath is { } resolvedPalettePath
-	? IndexedPalette.LoadFile(resolvedPalettePath)
-	: null;
 var jsonOptions = new JsonSerializerOptions
 {
 	WriteIndented = true,
@@ -30,17 +21,82 @@ var inputFiles = ResolveInputFiles(options.InputPaths.ToArray(), sampleRoot).ToA
 
 if (inputFiles.Length == 0)
 {
-	Console.Error.WriteLine("No .spb, .mob, or .fam files were found to inspect.");
+	Console.Error.WriteLine("No supported files were found to inspect.");
+	Console.Error.WriteLine("Default scan includes .spb, .mob, and .fam files; explicit input also supports CHAR.DAT, SAGA.BIN, and SAGA.SCP.");
 	Console.Error.WriteLine($"Checked: {sampleRoot}");
 	return 1;
 }
 
 Directory.CreateDirectory(outputRoot);
 
+string? resolvedPalettePath;
+try
+{
+	resolvedPalettePath = ResolvePalettePath(options, sampleRoot, outputRoot, jsonOptions);
+}
+catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or DirectoryNotFoundException or InvalidDataException or JsonException)
+{
+	Console.Error.WriteLine(ex.Message);
+	return 1;
+}
+
+var palette = resolvedPalettePath is { } palettePath
+	? IndexedPalette.LoadFile(palettePath)
+	: null;
+var hasExplicitPaletteSelection = palette is not null;
+var hasPreviewPaletteOverride = !string.IsNullOrWhiteSpace(options.PalettePath);
+List<TransitionScenePaletteCandidate> transitionScenePaletteCandidates;
+try
+{
+	transitionScenePaletteCandidates = !hasExplicitPaletteSelection
+		? LoadTransitionScenePaletteCandidates(sampleRoot, outputRoot, jsonOptions)
+		: new List<TransitionScenePaletteCandidate>();
+}
+catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or InvalidDataException or JsonException)
+{
+	Console.Error.WriteLine($"Transition-backed palette candidate scan skipped: {ex.Message}");
+	transitionScenePaletteCandidates = new List<TransitionScenePaletteCandidate>();
+}
+
+MenuEventPaletteCandidate? menuEventPaletteCandidate;
+try
+{
+	menuEventPaletteCandidate = !hasExplicitPaletteSelection
+		? TryLoadDiskresMenuPaletteCandidate(sampleRoot, outputRoot)
+		: null;
+}
+catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or InvalidDataException)
+{
+	Console.Error.WriteLine($"DISKRES menu/resource palette candidate skipped: {ex.Message}");
+	menuEventPaletteCandidate = null;
+}
+
 foreach (var inputFile in inputFiles)
 {
-	var archiveOutputDir = Path.Combine(outputRoot, Path.GetFileNameWithoutExtension(inputFile));
+	var archiveOutputDir = Path.Combine(
+		outputRoot,
+		BuildArchiveOutputDirectoryName(inputFile, hasExplicitPaletteSelection, transitionScenePaletteCandidates.Count > 0));
 	ResetDirectory(archiveOutputDir);
+
+	if (IsSupportedCharDat(inputFile))
+	{
+		WriteCharDatInspectionOutput(
+			inputFile,
+			archiveOutputDir,
+			jsonOptions,
+			options.WriteBinaryOutputs);
+		continue;
+	}
+
+	if (IsSupportedTransitionFile(inputFile))
+	{
+		WriteTransitionFileInspectionOutput(
+			inputFile,
+			archiveOutputDir,
+			jsonOptions,
+			options.WriteBinaryOutputs);
+		continue;
+	}
 
 	if (Path.GetExtension(inputFile).Equals(".fam", StringComparison.OrdinalIgnoreCase))
 	{
@@ -49,11 +105,36 @@ foreach (var inputFile in inputFiles)
 			archiveOutputDir,
 			jsonOptions,
 			options.WriteBinaryOutputs,
-			options.FamProbeSceneNames);
+			options.FamProbeSceneNames,
+			options.ProbeAllFamScenes);
 		continue;
 	}
 
 	var archive = ArchiveInspector.Inspect(inputFile);
+	if (transitionScenePaletteCandidates.Count > 0)
+	{
+		foreach (var candidate in transitionScenePaletteCandidates)
+		{
+			archive.Manifest.TransitionScenePaletteCandidates.Add(new TransitionScenePaletteCandidateManifest
+			{
+				SceneName = candidate.SceneName,
+				PaletteOutputFile = Path.GetRelativePath(outputRoot, candidate.PalettePath),
+				PaletteSourceDescription = candidate.Palette.SourceDescription,
+				MatchedInFiles = candidate.SourceFiles.ToList()
+			});
+		}
+	}
+
+	if (archive.Manifest.TypeCode == 0x2712 && menuEventPaletteCandidate is not null)
+	{
+		archive.Manifest.MenuEventPaletteCandidates.Add(new MenuEventPaletteCandidateManifest
+		{
+			CandidateName = menuEventPaletteCandidate.CandidateName,
+			PaletteOutputFile = Path.GetRelativePath(outputRoot, menuEventPaletteCandidate.PalettePath),
+			PaletteSourceDescription = menuEventPaletteCandidate.Palette.SourceDescription,
+			Evidence = menuEventPaletteCandidate.Evidence
+		});
+	}
 
 	if (options.WriteBinaryOutputs)
 	{
@@ -64,7 +145,10 @@ foreach (var inputFile in inputFiles)
 		}
 	}
 
-	var outputPalette = palette ?? archive.HeaderPalette;
+	var previewPalette = hasPreviewPaletteOverride
+		? palette
+		: archive.HeaderPalette ?? palette;
+	var liveWorldOutputPalette = palette ?? archive.HeaderPalette;
 
 	foreach (var entry in archive.Entries)
 	{
@@ -81,6 +165,12 @@ foreach (var inputFile in inputFiles)
 
 		var entryDir = Path.Combine(archiveOutputDir, $"entry_{entry.Manifest.Index:D3}");
 		Directory.CreateDirectory(entryDir);
+
+		if (entry.MobDataItems.Count > 0 || entry.MobMetadataRecords.Count > 0)
+		{
+			entry.Manifest.PreviewPaletteSource = previewPalette?.SourceDescription;
+			entry.Manifest.PaletteAuthority = "unresolved external palette; no traced live-world sprite binding for this entry";
+		}
 
 		foreach (var subresource in entry.Subresources)
 		{
@@ -112,12 +202,12 @@ foreach (var inputFile in inputFiles)
 						subresource.Manifest.DecodedMaskFile = maskFileName;
 					}
 
-					if (outputPalette is not null)
+					if (previewPalette is not null)
 					{
 						var pngFileName = $"{baseName}.png";
-						ImageWriter.WritePng(Path.Combine(entryDir, pngFileName), decodedImage, outputPalette);
+						ImageWriter.WritePng(Path.Combine(entryDir, pngFileName), decodedImage, previewPalette);
 						subresource.Manifest.DecodedPngFile = pngFileName;
-						subresource.Manifest.DecodedPaletteSource = outputPalette.SourceDescription;
+						subresource.Manifest.DecodedPaletteSource = previewPalette.SourceDescription;
 					}
 				}
 				else
@@ -187,12 +277,12 @@ foreach (var inputFile in inputFiles)
 							item.Manifest.DecodedMaskFile = maskFileName;
 						}
 
-						if (outputPalette is not null)
+						if (previewPalette is not null)
 						{
 							var pngFileName = $"{baseName}.png";
-							ImageWriter.WritePng(Path.Combine(dataDir, pngFileName), decodedImage, outputPalette);
+							ImageWriter.WritePng(Path.Combine(dataDir, pngFileName), decodedImage, previewPalette);
 							item.Manifest.DecodedPngFile = pngFileName;
-							item.Manifest.DecodedPaletteSource = outputPalette.SourceDescription;
+							item.Manifest.DecodedPaletteSource = previewPalette.SourceDescription;
 						}
 					}
 					else
@@ -204,7 +294,87 @@ foreach (var inputFile in inputFiles)
 			}
 		}
 
-		if (outputPalette is not null && decodedMobSprites.Count > 0 && entry.MobMetadataRecords.Count > 0)
+		var liveWorldSpriteItem = entry.MobDataItems
+			.FirstOrDefault(item => item.Manifest.Index == ArchiveInspector.LiveWorldSpriteDataItemIndex);
+		if (liveWorldSpriteItem is not null)
+		{
+			entry.Manifest.LiveWorldSpriteDataItemIndex = liveWorldSpriteItem.Manifest.Index;
+			entry.Manifest.LiveWorldBindingModel = "external-scene-record-table (0x1c058 room-level two-key/no-anchor; 0x1cc10 anchored three-key)";
+			entry.Manifest.PaletteAuthority = "proven live-world sprite item 0x0B; rendered under externally owned scene/state palette";
+
+			if (decodedMobSprites.TryGetValue(ArchiveInspector.LiveWorldSpriteDataItemIndex, out var liveWorldSpriteImage))
+			{
+				if (hasExplicitPaletteSelection && liveWorldOutputPalette is not null)
+				{
+					const string liveWorldSpriteFileName = "world_sprite.png";
+					ImageWriter.WritePng(Path.Combine(entryDir, liveWorldSpriteFileName), liveWorldSpriteImage, liveWorldOutputPalette);
+					entry.Manifest.LiveWorldSpriteDecodedPngFile = liveWorldSpriteFileName;
+					entry.Manifest.LiveWorldSpriteDecodedPaletteSource = liveWorldOutputPalette.SourceDescription;
+				}
+				else if (transitionScenePaletteCandidates.Count > 0)
+				{
+					const string candidateDirName = "world_sprite_scene_candidates";
+					var candidateDir = Path.Combine(entryDir, candidateDirName);
+					Directory.CreateDirectory(candidateDir);
+
+					for (var candidateIndex = 0; candidateIndex < transitionScenePaletteCandidates.Count; candidateIndex++)
+					{
+						var candidate = transitionScenePaletteCandidates[candidateIndex];
+						var candidateFileName = $"scene_{candidateIndex:D3}_{SanitizeFileComponent(candidate.SceneName)}.png";
+						ImageWriter.WritePng(Path.Combine(candidateDir, candidateFileName), liveWorldSpriteImage, candidate.Palette);
+						entry.Manifest.LiveWorldSpritePaletteCandidates.Add(new LiveWorldSpritePaletteCandidateManifest
+						{
+							SceneName = candidate.SceneName,
+							MatchedInFiles = candidate.SourceFiles.ToList(),
+							PaletteOutputFile = Path.GetRelativePath(outputRoot, candidate.PalettePath),
+							PaletteSourceDescription = candidate.Palette.SourceDescription,
+							DecodedPngFile = Path.Combine(candidateDirName, candidateFileName)
+						});
+					}
+				}
+				else if (liveWorldOutputPalette is not null)
+				{
+					const string liveWorldSpriteFileName = "world_sprite.png";
+					ImageWriter.WritePng(Path.Combine(entryDir, liveWorldSpriteFileName), liveWorldSpriteImage, liveWorldOutputPalette);
+					entry.Manifest.LiveWorldSpriteDecodedPngFile = liveWorldSpriteFileName;
+					entry.Manifest.LiveWorldSpriteDecodedPaletteSource = liveWorldOutputPalette.SourceDescription;
+				}
+			}
+		}
+
+		if (!hasExplicitPaletteSelection
+			&& menuEventPaletteCandidate is not null
+			&& entry.Manifest.LiveWorldSpriteDataItemIndex is null
+			&& decodedMobSprites.Count > 0)
+		{
+			var candidateRootDirName = Path.Combine("menu_palette_candidates", SanitizeFileComponent(menuEventPaletteCandidate.CandidateName));
+			var candidateRootDir = Path.Combine(entryDir, candidateRootDirName);
+			Directory.CreateDirectory(candidateRootDir);
+
+			foreach (var item in entry.MobDataItems)
+			{
+				if (!decodedMobSprites.TryGetValue(item.Manifest.Index, out var candidateImage))
+				{
+					continue;
+				}
+
+				var candidateFileName = $"item_{item.Manifest.Index:D3}.png";
+				ImageWriter.WritePng(
+					Path.Combine(candidateRootDir, candidateFileName),
+					candidateImage,
+					menuEventPaletteCandidate.Palette);
+				item.Manifest.PaletteCandidates.Add(new MobDataItemPaletteCandidateManifest
+				{
+					CandidateName = menuEventPaletteCandidate.CandidateName,
+					PaletteOutputFile = Path.GetRelativePath(outputRoot, menuEventPaletteCandidate.PalettePath),
+					PaletteSourceDescription = menuEventPaletteCandidate.Palette.SourceDescription,
+					Evidence = menuEventPaletteCandidate.Evidence,
+					DecodedPngFile = Path.Combine(candidateRootDirName, candidateFileName)
+				});
+			}
+		}
+
+		if (previewPalette is not null && decodedMobSprites.Count > 0 && entry.MobMetadataRecords.Count > 0)
 		{
 			var metadataDir = Path.Combine(entryDir, "metadata");
 			var framesDir = Path.Combine(metadataDir, "frames");
@@ -270,8 +440,9 @@ foreach (var inputFile in inputFiles)
 							Path.Combine(metadataDir, explicitPngFileName),
 							explicitPlacedFrames,
 							explicitPlacement,
-							outputPalette);
+							previewPalette);
 						record.Manifest.DecodedPngFile = explicitPngFileName;
+						record.Manifest.DecodedPaletteSource = previewPalette.SourceDescription;
 					}
 					catch (MobCanvasTooLargeException ex)
 					{
@@ -287,7 +458,7 @@ foreach (var inputFile in inputFiles)
 								Path.Combine(metadataDir, sequencePngFileName),
 								placedFrames,
 								sequencePlacement.Value,
-								outputPalette);
+								previewPalette);
 							record.Manifest.AlternateDecodedPngFile = sequencePngFileName;
 						}
 						catch (MobCanvasTooLargeException ex)
@@ -311,7 +482,7 @@ foreach (var inputFile in inputFiles)
 							Path.Combine(explicitSequenceFrameDir, frameFileName),
 							explicitPlacedFrame,
 							explicitPlacement,
-							outputPalette);
+							previewPalette);
 						explicitPlacedFrame.Element.DecodedPlacementX = explicitPlacedFrame.PlacementX;
 						explicitPlacedFrame.Element.DecodedPlacementY = explicitPlacedFrame.PlacementY;
 						explicitPlacedFrame.Element.DecodedPngFile = Path.Combine("frames", framesBaseName, frameFileName);
@@ -338,7 +509,7 @@ foreach (var inputFile in inputFiles)
 								Path.Combine(sequenceFrameDir, frameFileName),
 								placedFrame,
 								sequencePlacement.Value,
-								outputPalette);
+								previewPalette);
 							placedFrame.Element.AlternateDecodedPlacementX = placedFrame.PlacementX;
 							placedFrame.Element.AlternateDecodedPlacementY = placedFrame.PlacementY;
 							placedFrame.Element.AlternateDecodedPngFile = Path.Combine("frames-sequence", framesBaseName, frameFileName);
@@ -381,11 +552,11 @@ static IEnumerable<string> ResolveInputFiles(string[] args, string defaultRoot)
 
 		if (Directory.Exists(fullPath))
 		{
-			resolved.AddRange(Directory.EnumerateFiles(fullPath).Where(IsSupportedArchive));
+			resolved.AddRange(Directory.EnumerateFiles(fullPath).Where(IsSupportedExplicitInput));
 			continue;
 		}
 
-		if (File.Exists(fullPath) && IsSupportedArchive(fullPath))
+		if (File.Exists(fullPath) && IsSupportedExplicitInput(fullPath))
 		{
 			resolved.Add(fullPath);
 		}
@@ -402,11 +573,30 @@ static bool IsSupportedArchive(string path)
 		|| extension.Equals(".fam", StringComparison.OrdinalIgnoreCase);
 }
 
+static bool IsSupportedExplicitInput(string path)
+{
+	return IsSupportedArchive(path) || IsSupportedCharDat(path) || IsSupportedTransitionFile(path);
+}
+
+static bool IsSupportedCharDat(string path)
+{
+	return Path.GetFileName(path).Equals("CHAR.DAT", StringComparison.OrdinalIgnoreCase);
+}
+
+static bool IsSupportedTransitionFile(string path)
+{
+	var fileName = Path.GetFileName(path);
+	return fileName.Equals("SAGA.BIN", StringComparison.OrdinalIgnoreCase)
+		|| fileName.Equals("SAGA.SCP", StringComparison.OrdinalIgnoreCase);
+}
+
 static AppOptions ParseArguments(string[] args)
 {
 	var inputPaths = new List<string>();
 	var famProbeSceneNames = new List<string>();
+	var probeAllFamScenes = false;
 	string? palettePath = null;
+	string? forgaSceneName = null;
 	var writeBinaryOutputs = false;
 	var writeStripOutputs = false;
 	var writeSequenceRelativeOutputs = false;
@@ -424,6 +614,19 @@ static AppOptions ParseArguments(string[] args)
 			}
 
 			palettePath = Path.GetFullPath(args[++index]);
+			continue;
+		}
+
+		if (arg.Equals("--forga-scene", StringComparison.OrdinalIgnoreCase)
+			|| arg.Equals("--palette-scene", StringComparison.OrdinalIgnoreCase)
+			|| arg.Equals("--scene-palette", StringComparison.OrdinalIgnoreCase))
+		{
+			if (index + 1 >= args.Length)
+			{
+				throw new ArgumentException("Expected a FORGA scene or resource name after --forga-scene.");
+			}
+
+			forgaSceneName = args[++index];
 			continue;
 		}
 
@@ -459,6 +662,13 @@ static AppOptions ParseArguments(string[] args)
 			continue;
 		}
 
+		if (arg.Equals("--probe-all-scenes", StringComparison.OrdinalIgnoreCase)
+			|| arg.Equals("--fam-probe-all-scenes", StringComparison.OrdinalIgnoreCase))
+		{
+			probeAllFamScenes = true;
+			continue;
+		}
+
 		inputPaths.Add(arg);
 	}
 
@@ -466,11 +676,242 @@ static AppOptions ParseArguments(string[] args)
 	{
 		InputPaths = inputPaths,
 		PalettePath = palettePath,
+		ForgaSceneName = forgaSceneName,
 		WriteBinaryOutputs = writeBinaryOutputs,
 		WriteStripOutputs = writeStripOutputs,
 		WriteSequenceRelativeOutputs = writeSequenceRelativeOutputs,
-		FamProbeSceneNames = famProbeSceneNames
+		FamProbeSceneNames = famProbeSceneNames,
+		ProbeAllFamScenes = probeAllFamScenes
 	};
+}
+
+static string? ResolvePalettePath(
+	AppOptions options,
+	string sampleRoot,
+	string outputRoot,
+	JsonSerializerOptions jsonOptions)
+{
+	if (options.PalettePath is { } explicitPalettePath)
+	{
+		if (!File.Exists(explicitPalettePath))
+		{
+			throw new FileNotFoundException($"Palette file not found: {explicitPalettePath}");
+		}
+
+		return explicitPalettePath;
+	}
+
+	if (string.IsNullOrWhiteSpace(options.ForgaSceneName))
+	{
+		return null;
+	}
+
+	return ResolveForgaScenePalettePath(options.ForgaSceneName, sampleRoot, outputRoot, jsonOptions);
+}
+
+static string ResolveForgaScenePalettePath(
+	string sceneOrResourceName,
+	string sampleRoot,
+	string outputRoot,
+	JsonSerializerOptions jsonOptions)
+{
+	var forgaOutputDir = Path.Combine(outputRoot, "FORGA");
+	var manifest = LoadOrGenerateForgaManifest(sampleRoot, outputRoot, jsonOptions, ensurePaletteOutputs: false);
+
+	if (TryResolveForgaScenePalettePath(
+		manifest,
+		forgaOutputDir,
+		sceneOrResourceName,
+		out var palettePath,
+		out var requiresPaletteRefresh,
+		out var error))
+	{
+		return palettePath;
+	}
+
+	if (requiresPaletteRefresh)
+	{
+		manifest = LoadOrGenerateForgaManifest(sampleRoot, outputRoot, jsonOptions, ensurePaletteOutputs: true);
+		if (TryResolveForgaScenePalettePath(
+			manifest,
+			forgaOutputDir,
+			sceneOrResourceName,
+			out palettePath,
+			out _,
+			out error))
+		{
+			return palettePath;
+		}
+	}
+
+	throw new InvalidDataException(error);
+}
+
+static FamManifest LoadOrGenerateForgaManifest(
+	string sampleRoot,
+	string outputRoot,
+	JsonSerializerOptions jsonOptions,
+	bool ensurePaletteOutputs)
+{
+	var forgaOutputDir = Path.Combine(outputRoot, "FORGA");
+	var manifestPath = Path.Combine(forgaOutputDir, "manifest.json");
+
+	if (File.Exists(manifestPath))
+	{
+		var manifest = LoadForgaManifest(manifestPath);
+		if (!ensurePaletteOutputs || HasForgaRuntimePaletteOutputs(manifest, forgaOutputDir))
+		{
+			return manifest;
+		}
+	}
+
+	var forgaInputPath = Path.Combine(sampleRoot, "MAP", "FORGA.FAM");
+	if (!File.Exists(forgaInputPath))
+	{
+		throw new FileNotFoundException(
+			$"FORGA palette resolution needs either an existing extraction at {manifestPath} or the source archive at {forgaInputPath}.");
+	}
+
+	ResetDirectory(forgaOutputDir);
+	WriteFamInspectionOutput(
+		forgaInputPath,
+		forgaOutputDir,
+		jsonOptions,
+		writeBinaryOutputs: true,
+		Array.Empty<string>(),
+		probeAllFamScenes: false);
+
+	return LoadForgaManifest(manifestPath);
+}
+
+static FamManifest LoadForgaManifest(string manifestPath)
+{
+	var manifest = JsonSerializer.Deserialize<FamManifest>(File.ReadAllText(manifestPath));
+	if (manifest is null)
+	{
+		throw new InvalidDataException($"Failed to deserialize FORGA manifest at {manifestPath}.");
+	}
+
+	return manifest;
+}
+
+static bool HasForgaRuntimePaletteOutputs(FamManifest manifest, string forgaOutputDir)
+{
+	return manifest.Entries.Any(entry =>
+		entry.TableName == "second"
+		&& entry.RuntimePaletteOutputFile is { Length: > 0 } paletteRelativePath
+		&& File.Exists(Path.Combine(forgaOutputDir, paletteRelativePath)));
+}
+
+static bool TryResolveForgaScenePalettePath(
+	FamManifest manifest,
+	string forgaOutputDir,
+	string sceneOrResourceName,
+	out string palettePath,
+	out bool requiresPaletteRefresh,
+	out string error)
+{
+	palettePath = null!;
+	requiresPaletteRefresh = false;
+	error = string.Empty;
+
+	var firstTableEntries = manifest.Entries.Where(entry => entry.TableName == "first").ToArray();
+	var secondTableEntries = manifest.Entries.Where(entry => entry.TableName == "second").ToArray();
+	FamEntryManifest? secondEntry = null;
+
+	if (TryFindUniqueFamEntryByName(firstTableEntries, sceneOrResourceName, out var firstEntry, out var firstEntryError))
+	{
+		if (firstEntry is null)
+		{
+			error = $"FORGA scene/resource '{sceneOrResourceName}' resolved to a null first-table entry.";
+			return false;
+		}
+
+		var resourceName = firstEntry.ProbeResourceName ?? firstEntry.EmbeddedName ?? firstEntry.DecodedName;
+		if (!TryFindUniqueFamEntryByName(secondTableEntries, resourceName, out secondEntry, out var secondEntryError))
+		{
+			error = secondEntryError
+				?? $"FORGA scene '{sceneOrResourceName}' resolved to resource '{resourceName}', but no matching second-table entry was found.";
+			return false;
+		}
+	}
+	else if (!TryFindUniqueFamEntryByName(secondTableEntries, sceneOrResourceName, out secondEntry, out var secondEntryError))
+	{
+		error = firstEntryError
+			?? secondEntryError
+			?? $"FORGA scene/resource '{sceneOrResourceName}' was not found in {Path.Combine(forgaOutputDir, "manifest.json")}.";
+		return false;
+	}
+
+	if (secondEntry is null)
+	{
+		error = $"FORGA scene/resource '{sceneOrResourceName}' resolved to a null second-table entry.";
+		return false;
+	}
+
+	if (string.IsNullOrWhiteSpace(secondEntry.RuntimePaletteOutputFile))
+	{
+		requiresPaletteRefresh = true;
+		error = $"FORGA resource '{secondEntry.DecodedName}' is present but does not yet expose a runtime palette output file.";
+		return false;
+	}
+
+	var candidatePalettePath = Path.Combine(forgaOutputDir, secondEntry.RuntimePaletteOutputFile);
+	if (!File.Exists(candidatePalettePath))
+	{
+		requiresPaletteRefresh = true;
+		error = $"FORGA runtime palette file not found: {candidatePalettePath}";
+		return false;
+	}
+
+	palettePath = candidatePalettePath;
+	return true;
+}
+
+static bool TryFindUniqueFamEntryByName(
+	IEnumerable<FamEntryManifest> entries,
+	string name,
+	out FamEntryManifest? match,
+	out string? error)
+{
+	var exactMatches = entries
+		.Where(entry => entry.DecodedName.Equals(name, StringComparison.OrdinalIgnoreCase))
+		.ToList();
+	if (exactMatches.Count == 1)
+	{
+		match = exactMatches[0];
+		error = null;
+		return true;
+	}
+
+	if (exactMatches.Count > 1)
+	{
+		match = null;
+		error = $"FORGA name '{name}' is ambiguous. Use the exact scene name or an explicit palette path.";
+		return false;
+	}
+
+	var trimmedName = name.TrimEnd();
+	var trimmedMatches = entries
+		.Where(entry => entry.DecodedName.TrimEnd().Equals(trimmedName, StringComparison.OrdinalIgnoreCase))
+		.ToList();
+	if (trimmedMatches.Count == 1)
+	{
+		match = trimmedMatches[0];
+		error = null;
+		return true;
+	}
+
+	if (trimmedMatches.Count > 1)
+	{
+		match = null;
+		error = $"FORGA name '{name}' is ambiguous after trimming trailing spaces. Use the first-table scene name or an explicit palette path.";
+		return false;
+	}
+
+	match = null;
+	error = null;
+	return false;
 }
 
 static string BuildPayloadBaseName(ArchiveEntryManifest entry, ArchiveSubresourceManifest subresource)
@@ -515,6 +956,127 @@ static string SanitizeFileComponent(string value)
 	return string.IsNullOrEmpty(sanitized) ? "unnamed" : sanitized;
 }
 
+static string BuildArchiveOutputDirectoryName(
+	string inputFile,
+	bool hasExplicitPaletteSelection,
+	bool hasTransitionScenePaletteCandidates)
+{
+	if (IsSupportedTransitionFile(inputFile))
+	{
+		return Path.GetFileName(inputFile);
+	}
+
+	var baseName = Path.GetFileNameWithoutExtension(inputFile);
+	if (hasExplicitPaletteSelection
+		|| !hasTransitionScenePaletteCandidates
+		|| !Path.GetExtension(inputFile).Equals(".mob", StringComparison.OrdinalIgnoreCase))
+	{
+		return baseName;
+	}
+
+	return $"{baseName}_transition_candidates";
+}
+
+static List<TransitionScenePaletteCandidate> LoadTransitionScenePaletteCandidates(
+	string sampleRoot,
+	string outputRoot,
+	JsonSerializerOptions jsonOptions)
+{
+	var transitionFilePaths = new[]
+	{
+		Path.Combine(sampleRoot, "SAGA.BIN"),
+		Path.Combine(sampleRoot, "SAGA.SCP")
+	}.Where(File.Exists).ToArray();
+
+	if (transitionFilePaths.Length == 0)
+	{
+		return new List<TransitionScenePaletteCandidate>();
+	}
+
+	var manifest = LoadOrGenerateForgaManifest(sampleRoot, outputRoot, jsonOptions, ensurePaletteOutputs: true);
+	var knownSceneNames = manifest.Entries
+		.Where(entry => entry.TableName == "first")
+		.Select(entry => entry.DecodedName)
+		.ToHashSet(StringComparer.OrdinalIgnoreCase);
+	var matchedSceneSources = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+	foreach (var transitionFilePath in transitionFilePaths)
+	{
+		foreach (var token in ExtractTransitionSceneNameTokens(transitionFilePath))
+		{
+			if (!knownSceneNames.Contains(token))
+			{
+				continue;
+			}
+
+			if (!matchedSceneSources.TryGetValue(token, out var sources))
+			{
+				sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+				matchedSceneSources.Add(token, sources);
+			}
+
+			sources.Add(Path.GetFileName(transitionFilePath));
+		}
+	}
+
+	var candidates = new List<TransitionScenePaletteCandidate>(matchedSceneSources.Count);
+	foreach (var matchedScene in matchedSceneSources.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+	{
+		var resolvedPalettePath = ResolveForgaScenePalettePath(matchedScene.Key, sampleRoot, outputRoot, jsonOptions);
+		candidates.Add(new TransitionScenePaletteCandidate(
+			matchedScene.Key,
+			resolvedPalettePath,
+			IndexedPalette.LoadFile(resolvedPalettePath),
+			matchedScene.Value.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray()));
+	}
+
+	return candidates;
+}
+
+static IEnumerable<string> ExtractTransitionSceneNameTokens(string path)
+{
+	var content = Encoding.GetEncoding(949).GetString(File.ReadAllBytes(path));
+	var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+	foreach (Match match in Regex.Matches(content, @"(?<![A-Z0-9-])[A-Z][A-Z0-9-]{2,10}(?![A-Z0-9-])"))
+	{
+		var token = match.Value.Trim();
+		if (seen.Add(token))
+		{
+			yield return token;
+		}
+	}
+}
+
+static MenuEventPaletteCandidate? TryLoadDiskresMenuPaletteCandidate(string sampleRoot, string outputRoot)
+{
+	var diskresPath = Path.Combine(sampleRoot, "DISKRES.SPB");
+	if (!File.Exists(diskresPath))
+	{
+		return null;
+	}
+
+	var archive = ArchiveInspector.Inspect(diskresPath);
+	if (archive.HeaderPaletteBytes is null)
+	{
+		return null;
+	}
+
+	var diskresOutputDir = Path.Combine(outputRoot, "DISKRES");
+	Directory.CreateDirectory(diskresOutputDir);
+	var palettePath = Path.Combine(diskresOutputDir, "header_palette.rgbx.bin");
+	File.WriteAllBytes(palettePath, archive.HeaderPaletteBytes);
+
+	return new MenuEventPaletteCandidate(
+		"DISKRES outer menu resource header",
+		palettePath,
+		IndexedPalette.FromRawRgbx(
+			archive.HeaderPaletteBytes,
+			255,
+			"DISKRES.SPB header RGBX palette (traced outer menu/resource path via 0x17f96 -> 0x33512(1,0) -> 0x14ac1)"),
+		"Selector 1/0 resolves DISKRES.SPB entry 1 (GAME_OVER) subresource 0 before the outer full-palette upload at 0x18010.");
+}
+
 static void ResetDirectory(string path)
 {
 	if (Directory.Exists(path))
@@ -525,14 +1087,103 @@ static void ResetDirectory(string path)
 	Directory.CreateDirectory(path);
 }
 
+static void WriteCharDatInspectionOutput(
+	string inputFile,
+	string outputDir,
+	JsonSerializerOptions jsonOptions,
+	bool writeBinaryOutputs)
+{
+	var inspection = CharDatInspector.Inspect(inputFile, retainDecompressedPayload: writeBinaryOutputs);
+
+	if (writeBinaryOutputs)
+	{
+		File.WriteAllBytes(Path.Combine(outputDir, "header.bin"), inspection.HeaderBytes);
+		if (inspection.DecompressedPayload is not null)
+		{
+			File.WriteAllBytes(Path.Combine(outputDir, "decoded.bin"), inspection.DecompressedPayload);
+		}
+
+		var recordsDir = Path.Combine(outputDir, "records");
+		Directory.CreateDirectory(recordsDir);
+
+		foreach (var entry in inspection.Entries)
+		{
+			var fileName = $"record_{entry.Manifest.Index:D3}_{SanitizeFileComponent(entry.Manifest.DecodedName)}.bin";
+			File.WriteAllBytes(Path.Combine(recordsDir, fileName), entry.Payload);
+			entry.Manifest.OutputFile = Path.Combine("records", fileName);
+		}
+	}
+
+	File.WriteAllText(
+		Path.Combine(outputDir, "manifest.json"),
+		JsonSerializer.Serialize(inspection.Manifest, jsonOptions));
+
+	Console.WriteLine(
+		$"{Path.GetFileName(inputFile)}: type=CHAR.DAT, records={inspection.Manifest.RecordCount}, output={outputDir}");
+}
+
+static void WriteTransitionFileInspectionOutput(
+	string inputFile,
+	string outputDir,
+	JsonSerializerOptions jsonOptions,
+	bool writeBinaryOutputs)
+{
+	var inspection = TransitionFileInspector.Inspect(inputFile, retainDecompressedPayload: writeBinaryOutputs);
+
+	foreach (var section in inspection.Sections)
+	{
+		var sectionDirectoryName = SanitizeFileComponent(section.Manifest.SectionName);
+		var sectionDirectoryPath = Path.Combine(outputDir, sectionDirectoryName);
+		Directory.CreateDirectory(sectionDirectoryPath);
+
+		var sectionFileName = $"{sectionDirectoryName}.bin";
+		File.WriteAllBytes(Path.Combine(outputDir, sectionFileName), section.RawBytes);
+		section.Manifest.OutputFile = sectionFileName;
+
+		foreach (var entry in section.Entries)
+		{
+			var entryFileName = $"{sectionDirectoryName}_{entry.Manifest.Index:D3}.bin";
+			File.WriteAllBytes(Path.Combine(sectionDirectoryPath, entryFileName), entry.Payload);
+			entry.Manifest.OutputFile = Path.Combine(sectionDirectoryName, entryFileName);
+		}
+	}
+
+	if (writeBinaryOutputs)
+	{
+		File.WriteAllBytes(Path.Combine(outputDir, "header.bin"), inspection.HeaderBytes);
+		if (inspection.DecompressedPayload is not null)
+		{
+			File.WriteAllBytes(Path.Combine(outputDir, "decoded.bin"), inspection.DecompressedPayload);
+		}
+
+		if (inspection.PublishedSelectorRegion is { Length: > 0 })
+		{
+			const string publishedSelectorRegionFileName = "published_selector_region.bin";
+			File.WriteAllBytes(
+				Path.Combine(outputDir, publishedSelectorRegionFileName),
+				inspection.PublishedSelectorRegion);
+			inspection.Manifest.PublishedSelectorRegionOutputFile = publishedSelectorRegionFileName;
+		}
+	}
+
+	File.WriteAllText(
+		Path.Combine(outputDir, "manifest.json"),
+		JsonSerializer.Serialize(inspection.Manifest, jsonOptions));
+
+	Console.WriteLine(
+		$"{Path.GetFileName(inputFile)}: type={inspection.Manifest.Variant}, sections={inspection.Sections.Count}, output={outputDir}");
+}
+
 static void WriteFamInspectionOutput(
 	string inputFile,
 	string outputDir,
 	JsonSerializerOptions jsonOptions,
 	bool writeBinaryOutputs,
-	IReadOnlyList<string> famProbeSceneNames)
+	IReadOnlyList<string> famProbeSceneNames,
+	bool probeAllFamScenes)
 {
-	var retainDecompressedPayloads = writeBinaryOutputs || famProbeSceneNames.Count > 0;
+	var shouldProbeScenes = probeAllFamScenes || famProbeSceneNames.Count > 0;
+	var retainDecompressedPayloads = writeBinaryOutputs || shouldProbeScenes;
 	var inspection = FamInspector.Inspect(inputFile, retainDecompressedPayloads);
 	var firstTableDir = Path.Combine(outputDir, "first_table");
 	var secondTableDir = Path.Combine(outputDir, "second_table");
@@ -556,7 +1207,7 @@ static void WriteFamInspectionOutput(
 		File.WriteAllBytes(Path.Combine(absoluteDir, payloadFileName), entry.Payload);
 		entry.Manifest.OutputFile = Path.Combine(relativeDir, payloadFileName);
 
-		if (writeBinaryOutputs && entry.DecompressedPayload is not null)
+		if (retainDecompressedPayloads && entry.DecompressedPayload is not null)
 		{
 			var decodedFileName = $"{filePrefix}_{entry.Manifest.Index:D3}_{SanitizeFileComponent(entry.Manifest.DecodedName)}.decoded.bin";
 			File.WriteAllBytes(Path.Combine(absoluteDir, decodedFileName), entry.DecompressedPayload);
@@ -581,9 +1232,9 @@ static void WriteFamInspectionOutput(
 		}
 	}
 
-	if (famProbeSceneNames.Count > 0)
+	if (shouldProbeScenes)
 	{
-		WriteFamSceneProbeOutputs(outputDir, inspection, famProbeSceneNames);
+		WriteFamSceneProbeOutputs(outputDir, inspection, famProbeSceneNames, probeAllFamScenes);
 	}
 
 	File.WriteAllText(
@@ -597,7 +1248,8 @@ static void WriteFamInspectionOutput(
 static void WriteFamSceneProbeOutputs(
 	string outputDir,
 	FamInspection inspection,
-	IReadOnlyList<string> requestedSceneNames)
+	IReadOnlyList<string> requestedSceneNames,
+	bool probeAllScenes)
 {
 	var requested = new HashSet<string>(requestedSceneNames, StringComparer.OrdinalIgnoreCase);
 	var probesRoot = Path.Combine(outputDir, "scene_probes");
@@ -608,7 +1260,9 @@ static void WriteFamSceneProbeOutputs(
 		.GroupBy(entry => entry.Manifest.DecodedName, StringComparer.OrdinalIgnoreCase)
 		.ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
-	foreach (var firstEntry in inspection.Entries.Where(entry => entry.Manifest.TableName == "first" && requested.Contains(entry.Manifest.DecodedName)))
+	foreach (var firstEntry in inspection.Entries.Where(entry =>
+		entry.Manifest.TableName == "first"
+		&& (probeAllScenes || requested.Contains(entry.Manifest.DecodedName))))
 	{
 		firstEntry.Manifest.ProbeMode = "loader-derived-attr-base-overlay-scene";
 		var resourceName = firstEntry.Manifest.EmbeddedName ?? firstEntry.Manifest.DecodedName;
@@ -666,6 +1320,7 @@ static class ArchiveInspector
 	private const int HeaderPaletteEntryCount = 255;
 	private const string HeaderPaletteFormat = "RGBX";
 	private static readonly Encoding KoreanEncoding = Encoding.GetEncoding(949);
+	public const int LiveWorldSpriteDataItemIndex = 0x0B;
 
 	public static ArchiveInspection Inspect(string path)
 	{
@@ -989,7 +1644,8 @@ static class ArchiveInspector
 							RelativeOffset = relativeOffset,
 							PayloadSize = payloadSize,
 							ActualPayloadSpan = actualPayloadSpan,
-							WordPreview16 = BuildU16Preview(payload)
+							WordPreview16 = BuildU16Preview(payload),
+							IsLikelyLiveWorldSprite = itemIndex == LiveWorldSpriteDataItemIndex
 						};
 
 						if (MobSpriteDecoder.TryInspectLayout(payload, out var layout))
@@ -1458,7 +2114,7 @@ static class FamInspector
 		}
 	}
 
-	private static bool TryDecompressLz(
+	public static bool TryDecompressLz(
 		byte[] payload,
 		int startOffset,
 		out byte[] decoded,
@@ -1565,7 +2221,7 @@ static class FamInspector
 	{
 		var zeroIndex = Array.IndexOf(rawNameBytes, (byte)0);
 		var count = zeroIndex >= 0 ? zeroIndex : rawNameBytes.Length;
-		var decoded = AsciiEncoding.GetString(rawNameBytes, 0, count).Trim();
+		var decoded = AsciiEncoding.GetString(rawNameBytes, 0, count);
 		return string.IsNullOrEmpty(decoded) ? $"entry_{index:D3}" : decoded;
 	}
 
@@ -1649,10 +2305,12 @@ sealed class AppOptions
 {
 	public required List<string> InputPaths { get; init; }
 	public string? PalettePath { get; init; }
+	public string? ForgaSceneName { get; init; }
 	public bool WriteBinaryOutputs { get; init; }
 	public bool WriteStripOutputs { get; init; }
 	public bool WriteSequenceRelativeOutputs { get; init; }
 	public required List<string> FamProbeSceneNames { get; init; }
+	public bool ProbeAllFamScenes { get; init; }
 }
 
 static class FamSceneProbeWriter
@@ -1761,13 +2419,12 @@ static class FamSceneProbeWriter
 			return false;
 		}
 
-		var palette = IndexedPalette.FromHeaderRgbx(
+		var palette = IndexedPalette.FromRawRgbx(
 			secondEntry.DecompressedPayload.AsSpan(paletteOffset, paletteLength).ToArray(),
-			0,
 			paletteLength / 4,
 			$"FORGA.FAM probe palette from {secondEntry.Manifest.DecodedName}");
 		var lookupTableBytes = secondEntry.DecompressedPayload.AsSpan(lookupTableOffset, lookupTableLength).ToArray();
-		var tileBankLength = paletteOffset;
+		var tileBankLength = secondEntry.DecompressedPayload.Length;
 		if (tileBankLength <= 0 || tileBankLength % BytesPerTile != 0)
 		{
 			error = $"{secondEntry.Manifest.DecodedName} tile bank length {tileBankLength} is not a clean multiple of {BytesPerTile}-byte 8x8 tiles.";
@@ -1839,7 +2496,7 @@ static class FamSceneProbeWriter
 			lookupTableBytes);
 
 		probeNotes.Add($"Loader-backed first-buffer layout: attribute bytes @ +0x{attributeOffset:X}, base tile indices @ +0x{baseTileOffset:X}, overlay tile indices @ +0x{overlayTileOffset:X}; runtime map size is {width}x{runtimeHeight} after the loader trims 0x28 rows from the header height {headerHeight}.");
-		probeNotes.Add($"Secondary resource begins with {tileBankLength / BytesPerTile} 8x8 tiles ({tileBankLength} bytes) before the RGBX palette tail.");
+		probeNotes.Add($"Runtime draw path uses the full second decoded buffer as the 8x8 tile source ({tileBankLength / BytesPerTile} tiles / {tileBankLength} bytes) while also exposing palette and lookup-table views into its tail.");
 		probeNotes.Add($"The scene composite follows the runtime base-tile plus transparent-overlay draw path. Cells with attribute bit 0x80 would need an additional translation step through the engine's color table.");
 		probeNotes.Add(translationCellCount == 0
 			? "AREA02-style validation: no attribute byte sets bit 0x80, so the emitted scene composite does not need the unresolved translation-table step."
@@ -2166,6 +2823,8 @@ sealed record DecodedSpbImage(
 sealed class IndexedPalette
 {
 	private const int RawVgaPaletteLength = 256 * 3;
+	private const int RawRgbxPaletteEntryCountWithTransparentDefault = 255;
+	private const int RawRgbxPaletteEntryCountWithOpaqueIndex255 = 256;
 	private const ushort SpbTypeCode = 0x2711;
 	private const ushort MobTypeCode = 0x2712;
 	private const int EmbeddedHeaderPaletteOffset = 0x06;
@@ -2189,13 +2848,18 @@ sealed class IndexedPalette
 			return rawPalette;
 		}
 
+		if (TryLoadRawRgbx(bytes, path, out var rawRgbxPalette))
+		{
+			return rawRgbxPalette;
+		}
+
 		if (TryLoadEmbeddedHeaderRgbx(bytes, path, out var headerPalette))
 		{
 			return headerPalette;
 		}
 
 		throw new InvalidDataException(
-			$"{path} is {bytes.Length} bytes, expected either a 768-byte raw VGA palette or a 0x2711/0x2712 file with an embedded header RGBX palette.");
+			$"{path} is {bytes.Length} bytes, expected either a 768-byte raw VGA palette, a 255/256-entry raw RGBX palette, or a 0x2711/0x2712 file with an embedded header RGBX palette.");
 	}
 
 	private static bool TryLoadRawVga(byte[] bytes, string path, out IndexedPalette palette)
@@ -2225,6 +2889,32 @@ sealed class IndexedPalette
 		return true;
 	}
 
+	private static bool TryLoadRawRgbx(byte[] bytes, string path, out IndexedPalette palette)
+	{
+		if (bytes.Length == RawRgbxPaletteEntryCountWithTransparentDefault * 4)
+		{
+			palette = FromRgbxEntries(
+				bytes,
+				RawRgbxPaletteEntryCountWithTransparentDefault,
+				preserveIndex255: false,
+				$"raw RGBX palette from {Path.GetFileName(path)}");
+			return true;
+		}
+
+		if (bytes.Length == RawRgbxPaletteEntryCountWithOpaqueIndex255 * 4)
+		{
+			palette = FromRgbxEntries(
+				bytes,
+				RawRgbxPaletteEntryCountWithOpaqueIndex255,
+				preserveIndex255: true,
+				$"raw RGBX palette from {Path.GetFileName(path)}");
+			return true;
+		}
+
+		palette = null!;
+		return false;
+	}
+
 	private static bool TryLoadEmbeddedHeaderRgbx(byte[] bytes, string path, out IndexedPalette palette)
 	{
 		var requiredLength = EmbeddedHeaderPaletteOffset + (EmbeddedHeaderPaletteEntryCount * 4);
@@ -2249,8 +2939,36 @@ sealed class IndexedPalette
 		return true;
 	}
 
+	public static IndexedPalette FromRawRgbx(byte[] rgbxBytes, int entryCount, string? sourceDescription = null)
+	{
+		return FromRgbxEntries(
+			rgbxBytes,
+			entryCount,
+			preserveIndex255: entryCount >= 256,
+			sourceDescription ?? $"raw RGBX palette ({entryCount} entries)");
+	}
+
 	public static IndexedPalette FromHeaderRgbx(byte[] rgbxBytes, int offset, int entryCount, string? sourceDescription = null)
 	{
+		return FromRgbxEntries(
+			rgbxBytes,
+			entryCount,
+			preserveIndex255: false,
+			sourceDescription ?? $"embedded header RGBX palette @ 0x{offset:X} ({entryCount} entries)");
+	}
+
+	private static IndexedPalette FromRgbxEntries(byte[] rgbxBytes, int entryCount, bool preserveIndex255, string sourceDescription)
+	{
+		if (entryCount < 0 || entryCount > 256)
+		{
+			throw new ArgumentOutOfRangeException(nameof(entryCount), entryCount, "RGBX palette entry count must be between 0 and 256.");
+		}
+
+		if (rgbxBytes.Length < entryCount * 4)
+		{
+			throw new InvalidDataException($"RGBX palette is {rgbxBytes.Length} bytes, expected at least {entryCount * 4} bytes for {entryCount} entries.");
+		}
+
 		var colors = new Rgba32[256];
 
 		for (var index = 0; index < entryCount; index++)
@@ -2263,10 +2981,12 @@ sealed class IndexedPalette
 				0xFF);
 		}
 
-		colors[255] = default;
-		return new IndexedPalette(
-			colors,
-			sourceDescription ?? $"embedded header RGBX palette @ 0x{offset:X} ({entryCount} entries)");
+		if (!preserveIndex255)
+		{
+			colors[255] = default;
+		}
+
+		return new IndexedPalette(colors, sourceDescription);
 	}
 
 	private static byte ScaleVgaComponent(byte value)
@@ -2578,9 +3298,7 @@ static class ImageWriter
 					continue;
 				}
 
-				output[cellX + x, cellY + y] = paletteIndex == 0xFF
-					? default
-					: palette.Colors[paletteIndex];
+				output[cellX + x, cellY + y] = palette.Colors[paletteIndex];
 			}
 		}
 	}
@@ -2665,6 +3383,397 @@ sealed class MobCanvasTooLargeException : Exception
 	}
 }
 
+static class CharDatInspector
+{
+	private const int CountHeaderOffset = 0;
+	private const int LzStreamOffset = 4;
+	private const int RecordNameLength = 32;
+	private const int RecordSize = 0x3BC;
+	private const int NodeTemplateOffset = 0x20;
+	private const int NodeTemplateLength = 0xB8;
+	private const int SlotRecordSize = 0x20;
+	private const int PrimarySlotGroupOffset = 0xDC;
+	private const int PrimarySlotGroupCount = 8;
+	private const int SecondarySlotGroupCount = 5;
+	private static readonly int[] SecondarySlotGroupOffsets = { 0x1DC, 0x27C, 0x31C };
+	private static readonly Encoding KoreanEncoding = Encoding.GetEncoding(949);
+
+	public static CharDatInspection Inspect(string path, bool retainDecompressedPayload)
+	{
+		var data = File.ReadAllBytes(path);
+		if (data.Length < 8)
+		{
+			throw new InvalidDataException($"{path} is smaller than the CHAR.DAT count + LZ-size header.");
+		}
+
+		var recordCount = ReadUInt32(data, CountHeaderOffset);
+		var expectedDecodedSize64 = (ulong)recordCount * RecordSize;
+		if (expectedDecodedSize64 > int.MaxValue)
+		{
+			throw new InvalidDataException($"{path} expands to 0x{expectedDecodedSize64:X} bytes, which is too large to inspect in memory.");
+		}
+
+		var expectedDecodedSize = checked((int)expectedDecodedSize64);
+		var lzDecodedSize = ReadUInt32(data, LzStreamOffset);
+
+		if (!FamInspector.TryDecompressLz(data, LzStreamOffset, out var decoded, out var bytesConsumed, out var error))
+		{
+			throw new InvalidDataException($"Failed to decompress CHAR.DAT: {error}");
+		}
+
+		if (decoded.Length != expectedDecodedSize)
+		{
+			throw new InvalidDataException(
+				$"CHAR.DAT decompressed to {decoded.Length} bytes, but the runtime-derived record count requires {expectedDecodedSize} bytes ({recordCount} * 0x{RecordSize:X}).");
+		}
+
+		if (lzDecodedSize != expectedDecodedSize)
+		{
+			throw new InvalidDataException(
+				$"CHAR.DAT LZ header advertises 0x{lzDecodedSize:X} bytes, but the runtime-derived record table requires 0x{expectedDecodedSize:X} bytes.");
+		}
+
+		var manifests = new List<CharDatRecordManifest>(checked((int)recordCount));
+		var entries = new List<CharDatRecordPayload>(checked((int)recordCount));
+
+		for (var index = 0; index < recordCount; index++)
+		{
+			var recordOffset = checked((int)index * RecordSize);
+			var payload = decoded.AsSpan(recordOffset, RecordSize).ToArray();
+			var rawNameBytes = payload.AsSpan(0, RecordNameLength).ToArray();
+
+			var manifest = new CharDatRecordManifest
+			{
+				Index = checked((int)index),
+				RecordOffset = recordOffset,
+				DecodedName = DecodeName(rawNameBytes),
+				RawNameHex = Convert.ToHexString(rawNameBytes)
+			};
+
+			manifests.Add(manifest);
+			entries.Add(new CharDatRecordPayload(manifest, payload));
+		}
+
+		var manifestModel = new CharDatManifest
+		{
+			FileName = Path.GetFileName(path),
+			FullPath = path,
+			RecordCount = recordCount,
+			RecordSize = RecordSize,
+			CountHeaderOffset = CountHeaderOffset,
+			LzStreamOffset = LzStreamOffset,
+			LzDecodedSize = lzDecodedSize,
+			ExpectedDecodedSize = checked((uint)expectedDecodedSize),
+			LzBytesConsumed = bytesConsumed,
+			NameFieldLength = RecordNameLength,
+			NodeTemplateOffset = NodeTemplateOffset,
+			NodeTemplateLength = NodeTemplateLength,
+			SlotRecordSize = SlotRecordSize,
+			PrimarySlotGroupOffset = PrimarySlotGroupOffset,
+			PrimarySlotGroupCount = PrimarySlotGroupCount,
+			SecondarySlotGroupCount = SecondarySlotGroupCount,
+			Entries = manifests
+		};
+		manifestModel.SecondarySlotGroupOffsets.AddRange(SecondarySlotGroupOffsets);
+
+		return new CharDatInspection(
+			manifestModel,
+			entries,
+			data.AsSpan(0, 8).ToArray(),
+			retainDecompressedPayload ? decoded : null);
+	}
+
+	private static string DecodeName(byte[] rawNameBytes)
+	{
+		var zeroIndex = Array.IndexOf(rawNameBytes, (byte)0);
+		var count = zeroIndex >= 0 ? zeroIndex : rawNameBytes.Length;
+		if (count == 0)
+		{
+			return string.Empty;
+		}
+
+		return KoreanEncoding.GetString(rawNameBytes, 0, count).Trim();
+	}
+
+	private static uint ReadUInt32(byte[] data, int offset)
+	{
+		return BitConverter.ToUInt32(data, offset);
+	}
+}
+
+static class TransitionFileInspector
+{
+	private const int CountHeaderOffset = 0;
+	private const int LzStreamOffset = 4;
+	private const int ScpRootCountOffset = 0;
+	private const int ScpRootTableOffset = 2;
+	private const int ScpRootRecordSize = 0x24;
+	private const int ScpBlobOffsetFieldOffset = 0x20;
+	private const int ScpBlobOffsetBias = 4;
+	private const int BinFirstSectionCountOffset = 0;
+	private const int BinFirstSectionOffset = 2;
+	private const int BinFirstSectionEntrySize = 0x80;
+	private const int BinSecondSectionEntrySize = 0x44;
+	private static readonly Encoding KoreanEncoding = Encoding.GetEncoding(949);
+
+	public static TransitionFileInspection Inspect(string path, bool retainDecompressedPayload)
+	{
+		var data = File.ReadAllBytes(path);
+		if (data.Length < LzStreamOffset + 1)
+		{
+			throw new InvalidDataException($"{path} is smaller than the transition-file decode header.");
+		}
+
+		var lzDecodedSize = ReadUInt32(data, CountHeaderOffset);
+		if (!FamInspector.TryDecompressLz(data, CountHeaderOffset, out var decoded, out var bytesConsumed, out var error))
+		{
+			throw new InvalidDataException($"Failed to decompress {Path.GetFileName(path)}: {error}");
+		}
+
+		var fileName = Path.GetFileName(path);
+		if (fileName.Equals("SAGA.SCP", StringComparison.OrdinalIgnoreCase))
+		{
+			return InspectSagaScp(path, data, decoded, lzDecodedSize, bytesConsumed, retainDecompressedPayload);
+		}
+
+		if (fileName.Equals("SAGA.BIN", StringComparison.OrdinalIgnoreCase))
+		{
+			return InspectSagaBin(path, data, decoded, lzDecodedSize, bytesConsumed, retainDecompressedPayload);
+		}
+
+		throw new InvalidDataException($"Unsupported transition file: {path}");
+	}
+
+	private static TransitionFileInspection InspectSagaScp(
+		string path,
+		byte[] encoded,
+		byte[] decoded,
+		uint lzDecodedSize,
+		int bytesConsumed,
+		bool retainDecompressedPayload)
+	{
+		var recordCount = ReadUInt16(decoded, ScpRootCountOffset);
+		var tableLength = checked(recordCount * ScpRootRecordSize);
+		var minimumBlobDataOffset = checked(ScpRootTableOffset + tableLength);
+		var rootSection = BuildSection(
+			decoded,
+			"root_0x24_records",
+			ScpRootTableOffset,
+			recordCount,
+			ScpRootRecordSize,
+			blobOffsetFieldOffset: ScpBlobOffsetFieldOffset,
+			blobOffsetBias: ScpBlobOffsetBias,
+			minimumBlobDataOffset: minimumBlobDataOffset);
+
+		var sections = new List<TransitionSectionInspection> { rootSection };
+		var manifest = new TransitionFileManifest
+		{
+			FileName = Path.GetFileName(path),
+			FullPath = path,
+			Variant = "SAGA.SCP",
+			CountHeaderOffset = CountHeaderOffset,
+			LzStreamOffset = LzStreamOffset,
+			LzDecodedSize = lzDecodedSize,
+			LzBytesConsumed = bytesConsumed,
+			DecompressedLength = decoded.Length,
+			RootRecordCount = recordCount,
+			RootRecordOffset = ScpRootTableOffset,
+			RootRecordSize = ScpRootRecordSize,
+			Sections = sections.Select(section => section.Manifest).ToList()
+		};
+
+		return new TransitionFileInspection(
+			manifest,
+			sections,
+			encoded.AsSpan(0, LzStreamOffset).ToArray(),
+			retainDecompressedPayload ? decoded : null,
+			null);
+	}
+
+	private static TransitionFileInspection InspectSagaBin(
+		string path,
+		byte[] encoded,
+		byte[] decoded,
+		uint lzDecodedSize,
+		int bytesConsumed,
+		bool retainDecompressedPayload)
+	{
+		var firstSectionCount = ReadUInt16(decoded, BinFirstSectionCountOffset);
+		var firstSectionLength = checked(firstSectionCount * BinFirstSectionEntrySize);
+		var secondSectionCountOffset = checked(BinFirstSectionOffset + firstSectionLength);
+		EnsureAvailable(decoded, secondSectionCountOffset, 2, path, "SAGA.BIN second-section count");
+
+		var secondSectionCount = ReadUInt16(decoded, secondSectionCountOffset);
+		var secondSectionOffset = secondSectionCountOffset + 2;
+		var secondSectionLength = checked(secondSectionCount * BinSecondSectionEntrySize);
+		var publishedSelectorCountOffset = checked(secondSectionOffset + secondSectionLength);
+		EnsureAvailable(decoded, publishedSelectorCountOffset, 2, path, "SAGA.BIN published selector count");
+
+		var publishedSelectorCount = ReadUInt16(decoded, publishedSelectorCountOffset);
+		var publishedSelectorOffset = publishedSelectorCountOffset + 2;
+		EnsureAvailable(decoded, publishedSelectorOffset, 0, path, "SAGA.BIN published selector table");
+
+		var firstSection = BuildSection(
+			decoded,
+			"first_0x80_records",
+			BinFirstSectionOffset,
+			firstSectionCount,
+			BinFirstSectionEntrySize);
+		var secondSection = BuildSection(
+			decoded,
+			"second_0x44_records",
+			secondSectionOffset,
+			secondSectionCount,
+			BinSecondSectionEntrySize);
+		var sections = new List<TransitionSectionInspection> { firstSection, secondSection };
+		var publishedSelectorRegion = decoded.AsSpan(publishedSelectorOffset).ToArray();
+
+		var manifest = new TransitionFileManifest
+		{
+			FileName = Path.GetFileName(path),
+			FullPath = path,
+			Variant = "SAGA.BIN",
+			CountHeaderOffset = CountHeaderOffset,
+			LzStreamOffset = LzStreamOffset,
+			LzDecodedSize = lzDecodedSize,
+			LzBytesConsumed = bytesConsumed,
+			DecompressedLength = decoded.Length,
+			FirstSectionCount = firstSectionCount,
+			FirstSectionOffset = BinFirstSectionOffset,
+			FirstSectionEntrySize = BinFirstSectionEntrySize,
+			SecondSectionCount = secondSectionCount,
+			SecondSectionOffset = secondSectionOffset,
+			SecondSectionEntrySize = BinSecondSectionEntrySize,
+			PublishedSelectorCount = publishedSelectorCount,
+			PublishedSelectorOffset = publishedSelectorOffset,
+			PublishedSelectorRegionLength = publishedSelectorRegion.Length,
+			PublishedSelectorRegionFirstBytesHex = BuildHexPreview(publishedSelectorRegion, 24),
+			Sections = sections.Select(section => section.Manifest).ToList()
+		};
+
+		return new TransitionFileInspection(
+			manifest,
+			sections,
+			encoded.AsSpan(0, LzStreamOffset).ToArray(),
+			retainDecompressedPayload ? decoded : null,
+			publishedSelectorRegion);
+	}
+
+	private static TransitionSectionInspection BuildSection(
+		byte[] decoded,
+		string sectionName,
+		int tableOffset,
+		int entryCount,
+		int entrySize,
+		int? blobOffsetFieldOffset = null,
+		int blobOffsetBias = 0,
+		int? minimumBlobDataOffset = null)
+	{
+		var tableLength = checked(entryCount * entrySize);
+		EnsureAvailable(decoded, tableOffset, tableLength, sectionName, "table bytes");
+
+		var manifests = new List<TransitionSectionEntryManifest>(entryCount);
+		var entries = new List<TransitionSectionEntryPayload>(entryCount);
+
+		for (var index = 0; index < entryCount; index++)
+		{
+			var entryOffset = checked(tableOffset + (index * entrySize));
+			var payload = decoded.AsSpan(entryOffset, entrySize).ToArray();
+
+			uint? blobFieldValue = null;
+			int? blobDataOffsetCandidate = null;
+			if (blobOffsetFieldOffset is { } fieldOffset && fieldOffset + 4 <= payload.Length)
+			{
+				var candidate = ReadUInt32(payload, fieldOffset);
+				blobFieldValue = candidate;
+				var candidateOffset = (long)candidate + blobOffsetBias;
+				if (candidateOffset >= 0
+					&& candidateOffset < decoded.Length
+					&& (!minimumBlobDataOffset.HasValue || candidateOffset >= minimumBlobDataOffset.Value))
+				{
+					blobDataOffsetCandidate = checked((int)candidateOffset);
+				}
+			}
+
+			var manifest = new TransitionSectionEntryManifest
+			{
+				SectionName = sectionName,
+				Index = index,
+				EntryOffset = entryOffset,
+				FirstBytesHex = BuildHexPreview(payload, 24),
+				TextPreview = BuildTextPreview(payload),
+				BlobOffsetField = blobFieldValue,
+				BlobDataOffsetCandidate = blobDataOffsetCandidate
+			};
+
+			manifests.Add(manifest);
+			entries.Add(new TransitionSectionEntryPayload(manifest, payload));
+		}
+
+		return new TransitionSectionInspection(
+			new TransitionSectionManifest
+			{
+				SectionName = sectionName,
+				TableOffset = tableOffset,
+				EntryCount = entryCount,
+				EntrySize = entrySize,
+				Entries = manifests
+			},
+			entries,
+			decoded.AsSpan(tableOffset, tableLength).ToArray());
+	}
+
+	private static string? BuildTextPreview(byte[] payload)
+	{
+		var previewLength = Math.Min(payload.Length, 32);
+		if (previewLength == 0)
+		{
+			return null;
+		}
+
+		var decoded = KoreanEncoding.GetString(payload, 0, previewLength);
+		var builder = new StringBuilder(decoded.Length);
+		foreach (var character in decoded)
+		{
+			if (character == '\0')
+			{
+				continue;
+			}
+
+			builder.Append(char.IsControl(character) ? ' ' : character);
+		}
+
+		var normalized = Regex.Replace(builder.ToString(), @"\s+", " ").Trim();
+		return string.IsNullOrEmpty(normalized) ? null : normalized;
+	}
+
+	private static string BuildHexPreview(byte[] payload, int maxBytes)
+	{
+		var previewLength = Math.Min(payload.Length, maxBytes);
+		return previewLength == 0
+			? string.Empty
+			: Convert.ToHexString(payload.AsSpan(0, previewLength));
+	}
+
+	private static void EnsureAvailable(byte[] data, int offset, int length, string path, string description)
+	{
+		if (offset < 0 || length < 0 || offset + length > data.Length)
+		{
+			throw new InvalidDataException($"{path} does not contain a complete {description} at 0x{offset:X} (length 0x{length:X}).");
+		}
+	}
+
+	private static ushort ReadUInt16(byte[] data, int offset)
+	{
+		return BitConverter.ToUInt16(data, offset);
+	}
+
+	private static uint ReadUInt32(byte[] data, int offset)
+	{
+		return BitConverter.ToUInt32(data, offset);
+	}
+}
+
 sealed record ArchiveInspection(
 	ArchiveManifest Manifest,
 	List<ArchiveEntryPayloads> Entries,
@@ -2679,6 +3788,28 @@ sealed record FamInspection(
 	byte[] FirstTableBytes,
 	byte[] SecondHeaderBytes,
 	byte[] SecondTableBytes);
+
+sealed record CharDatInspection(
+	CharDatManifest Manifest,
+	List<CharDatRecordPayload> Entries,
+	byte[] HeaderBytes,
+	byte[]? DecompressedPayload);
+
+sealed record TransitionFileInspection(
+	TransitionFileManifest Manifest,
+	List<TransitionSectionInspection> Sections,
+	byte[] HeaderBytes,
+	byte[]? DecompressedPayload,
+	byte[]? PublishedSelectorRegion);
+
+sealed record TransitionSectionInspection(
+	TransitionSectionManifest Manifest,
+	List<TransitionSectionEntryPayload> Entries,
+	byte[] RawBytes);
+
+sealed record TransitionSectionEntryPayload(
+	TransitionSectionEntryManifest Manifest,
+	byte[] Payload);
 
 sealed record ArchiveEntryPayloads(
 	ArchiveEntryManifest Manifest,
@@ -2704,6 +3835,22 @@ sealed record FamEntryPayload(
 	FamEntryManifest Manifest,
 	byte[] Payload,
 	byte[]? DecompressedPayload);
+
+sealed record CharDatRecordPayload(
+	CharDatRecordManifest Manifest,
+	byte[] Payload);
+
+sealed record TransitionScenePaletteCandidate(
+	string SceneName,
+	string PalettePath,
+	IndexedPalette Palette,
+	IReadOnlyList<string> SourceFiles);
+
+sealed record MenuEventPaletteCandidate(
+	string CandidateName,
+	string PalettePath,
+	IndexedPalette Palette,
+	string Evidence);
 
 sealed record MobResolvedFrame(
 	MobMetadataElementManifest Element,
@@ -2750,6 +3897,8 @@ sealed class ArchiveManifest
 	public int? HeaderPaletteOffset { get; init; }
 	public int? HeaderPaletteEntryCount { get; init; }
 	public string? HeaderPaletteFormat { get; init; }
+	public List<TransitionScenePaletteCandidateManifest> TransitionScenePaletteCandidates { get; } = new();
+	public List<MenuEventPaletteCandidateManifest> MenuEventPaletteCandidates { get; } = new();
 	public required List<ArchiveEntryManifest> Entries { get; init; }
 }
 
@@ -2771,6 +3920,77 @@ sealed class FamManifest
 	public required List<FamEntryManifest> Entries { get; init; }
 }
 
+sealed class CharDatManifest
+{
+	public required string FileName { get; init; }
+	public required string FullPath { get; init; }
+	public required uint RecordCount { get; init; }
+	public required int RecordSize { get; init; }
+	public required int CountHeaderOffset { get; init; }
+	public required int LzStreamOffset { get; init; }
+	public required uint LzDecodedSize { get; init; }
+	public required uint ExpectedDecodedSize { get; init; }
+	public required int LzBytesConsumed { get; init; }
+	public required int NameFieldLength { get; init; }
+	public required int NodeTemplateOffset { get; init; }
+	public required int NodeTemplateLength { get; init; }
+	public required int SlotRecordSize { get; init; }
+	public required int PrimarySlotGroupOffset { get; init; }
+	public required int PrimarySlotGroupCount { get; init; }
+	public required int SecondarySlotGroupCount { get; init; }
+	public List<int> SecondarySlotGroupOffsets { get; } = new();
+	public required List<CharDatRecordManifest> Entries { get; init; }
+}
+
+sealed class TransitionFileManifest
+{
+	public required string FileName { get; init; }
+	public required string FullPath { get; init; }
+	public required string Variant { get; init; }
+	public required int CountHeaderOffset { get; init; }
+	public required int LzStreamOffset { get; init; }
+	public required uint LzDecodedSize { get; init; }
+	public required int LzBytesConsumed { get; init; }
+	public required int DecompressedLength { get; init; }
+	public int? RootRecordCount { get; init; }
+	public int? RootRecordOffset { get; init; }
+	public int? RootRecordSize { get; init; }
+	public int? FirstSectionCount { get; init; }
+	public int? FirstSectionOffset { get; init; }
+	public int? FirstSectionEntrySize { get; init; }
+	public int? SecondSectionCount { get; init; }
+	public int? SecondSectionOffset { get; init; }
+	public int? SecondSectionEntrySize { get; init; }
+	public int? PublishedSelectorCount { get; init; }
+	public int? PublishedSelectorOffset { get; init; }
+	public int? PublishedSelectorRegionLength { get; init; }
+	public string? PublishedSelectorRegionFirstBytesHex { get; init; }
+	public string? PublishedSelectorRegionOutputFile { get; set; }
+	public required List<TransitionSectionManifest> Sections { get; init; }
+}
+
+sealed class TransitionSectionManifest
+{
+	public required string SectionName { get; init; }
+	public required int TableOffset { get; init; }
+	public required int EntryCount { get; init; }
+	public required int EntrySize { get; init; }
+	public string? OutputFile { get; set; }
+	public required List<TransitionSectionEntryManifest> Entries { get; init; }
+}
+
+sealed class TransitionSectionEntryManifest
+{
+	public required string SectionName { get; init; }
+	public required int Index { get; init; }
+	public required int EntryOffset { get; init; }
+	public required string FirstBytesHex { get; init; }
+	public string? TextPreview { get; init; }
+	public uint? BlobOffsetField { get; init; }
+	public int? BlobDataOffsetCandidate { get; init; }
+	public string? OutputFile { get; set; }
+}
+
 sealed class ArchiveEntryManifest
 {
 	public required int Index { get; init; }
@@ -2786,9 +4006,41 @@ sealed class ArchiveEntryManifest
 	public ushort? MobDataItemCount { get; set; }
 	public uint? MobDataExpectedSpan { get; set; }
 	public uint? MobDataActualSpan { get; set; }
+	public string? PreviewPaletteSource { get; set; }
+	public string? PaletteAuthority { get; set; }
+	public int? LiveWorldSpriteDataItemIndex { get; set; }
+	public string? LiveWorldBindingModel { get; set; }
+	public string? LiveWorldSpriteDecodedPngFile { get; set; }
+	public string? LiveWorldSpriteDecodedPaletteSource { get; set; }
+	public List<LiveWorldSpritePaletteCandidateManifest> LiveWorldSpritePaletteCandidates { get; } = new();
 	public List<ArchiveSubresourceManifest> Subresources { get; } = new();
 	public List<MobMetadataRecordManifest> MobMetadataRecords { get; } = new();
 	public List<MobDataItemManifest> MobDataItems { get; } = new();
+}
+
+sealed class TransitionScenePaletteCandidateManifest
+{
+	public required string SceneName { get; init; }
+	public required string PaletteOutputFile { get; init; }
+	public required string PaletteSourceDescription { get; init; }
+	public required List<string> MatchedInFiles { get; init; }
+}
+
+sealed class MenuEventPaletteCandidateManifest
+{
+	public required string CandidateName { get; init; }
+	public required string PaletteOutputFile { get; init; }
+	public required string PaletteSourceDescription { get; init; }
+	public required string Evidence { get; init; }
+}
+
+sealed class LiveWorldSpritePaletteCandidateManifest
+{
+	public required string SceneName { get; init; }
+	public required List<string> MatchedInFiles { get; init; }
+	public required string PaletteOutputFile { get; init; }
+	public required string PaletteSourceDescription { get; init; }
+	public required string DecodedPngFile { get; init; }
 }
 
 sealed class FamEntryManifest
@@ -2836,6 +4088,15 @@ sealed class FamEntryManifest
 	public List<string> AsciiPreview { get; } = new();
 }
 
+sealed class CharDatRecordManifest
+{
+	public required int Index { get; init; }
+	public required int RecordOffset { get; init; }
+	public required string DecodedName { get; init; }
+	public required string RawNameHex { get; init; }
+	public string? OutputFile { get; set; }
+}
+
 sealed class MobMetadataRecordManifest
 {
 	public required int Index { get; init; }
@@ -2851,6 +4112,7 @@ sealed class MobMetadataRecordManifest
 	public int? DecodedCanvasHeight { get; set; }
 	public string? DecodedPlacementMode { get; set; }
 	public string? DecodedPngFile { get; set; }
+	public string? DecodedPaletteSource { get; set; }
 	public string? DecodedExportError { get; set; }
 	public int? AlternateDecodedCanvasWidth { get; set; }
 	public int? AlternateDecodedCanvasHeight { get; set; }
@@ -2883,6 +4145,7 @@ sealed class MobDataItemManifest
 	public required uint PayloadSize { get; init; }
 	public required uint ActualPayloadSpan { get; init; }
 	public string? WordPreview16 { get; init; }
+	public bool IsLikelyLiveWorldSprite { get; init; }
 	public int? CandidateWidth { get; set; }
 	public int? CandidateHeight { get; set; }
 	public uint? CandidateTailLength { get; set; }
@@ -2897,6 +4160,16 @@ sealed class MobDataItemManifest
 	public string? DecodedMaskFile { get; set; }
 	public string? DecodedPngFile { get; set; }
 	public string? DecodedPaletteSource { get; set; }
+	public List<MobDataItemPaletteCandidateManifest> PaletteCandidates { get; } = new();
+}
+
+sealed class MobDataItemPaletteCandidateManifest
+{
+	public required string CandidateName { get; init; }
+	public required string PaletteOutputFile { get; init; }
+	public required string PaletteSourceDescription { get; init; }
+	public required string Evidence { get; init; }
+	public required string DecodedPngFile { get; init; }
 }
 
 sealed class ArchiveSubresourceManifest
