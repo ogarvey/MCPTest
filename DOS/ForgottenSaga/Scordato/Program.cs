@@ -71,6 +71,11 @@ catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundExcep
 	menuEventPaletteCandidate = null;
 }
 
+var externalPaletteCandidates = !hasExplicitPaletteSelection
+	? BuildExternalPaletteCandidates(transitionScenePaletteCandidates, menuEventPaletteCandidate)
+	: new List<ExternalPaletteCandidate>();
+var hasGenericPaletteCandidates = externalPaletteCandidates.Count > 0;
+
 foreach (var inputFile in inputFiles)
 {
 	var archiveOutputDir = Path.Combine(
@@ -93,6 +98,7 @@ foreach (var inputFile in inputFiles)
 		WriteTransitionFileInspectionOutput(
 			inputFile,
 			archiveOutputDir,
+			sampleRoot,
 			jsonOptions,
 			options.WriteBinaryOutputs);
 		continue;
@@ -169,7 +175,7 @@ foreach (var inputFile in inputFiles)
 		if (entry.MobDataItems.Count > 0 || entry.MobMetadataRecords.Count > 0)
 		{
 			entry.Manifest.PreviewPaletteSource = previewPalette?.SourceDescription;
-			entry.Manifest.PaletteAuthority = "unresolved external palette; no traced live-world sprite binding for this entry";
+			entry.Manifest.PaletteAuthority = "external palette authority unresolved; preview uses archive/header palette when present and runtime-backed external palette candidates stay separate";
 		}
 
 		foreach (var subresource in entry.Subresources)
@@ -342,39 +348,45 @@ foreach (var inputFile in inputFiles)
 			}
 		}
 
-		if (!hasExplicitPaletteSelection
-			&& menuEventPaletteCandidate is not null
-			&& entry.Manifest.LiveWorldSpriteDataItemIndex is null
-			&& decodedMobSprites.Count > 0)
+		if (hasGenericPaletteCandidates && decodedMobSprites.Count > 0)
 		{
-			var candidateRootDirName = Path.Combine("menu_palette_candidates", SanitizeFileComponent(menuEventPaletteCandidate.CandidateName));
-			var candidateRootDir = Path.Combine(entryDir, candidateRootDirName);
-			Directory.CreateDirectory(candidateRootDir);
+			var paletteCandidatesRootDirName = "palette_candidates";
+			var paletteCandidatesRootDir = Path.Combine(entryDir, paletteCandidatesRootDirName);
+			Directory.CreateDirectory(paletteCandidatesRootDir);
 
-			foreach (var item in entry.MobDataItems)
+			foreach (var paletteCandidate in externalPaletteCandidates)
 			{
-				if (!decodedMobSprites.TryGetValue(item.Manifest.Index, out var candidateImage))
-				{
-					continue;
-				}
+				var candidateRootDirName = Path.Combine(paletteCandidatesRootDirName, paletteCandidate.DirectoryName);
+				var candidateRootDir = Path.Combine(entryDir, candidateRootDirName);
+				Directory.CreateDirectory(candidateRootDir);
 
-				var candidateFileName = $"item_{item.Manifest.Index:D3}.png";
-				ImageWriter.WritePng(
-					Path.Combine(candidateRootDir, candidateFileName),
-					candidateImage,
-					menuEventPaletteCandidate.Palette);
-				item.Manifest.PaletteCandidates.Add(new MobDataItemPaletteCandidateManifest
+				foreach (var item in entry.MobDataItems)
 				{
-					CandidateName = menuEventPaletteCandidate.CandidateName,
-					PaletteOutputFile = Path.GetRelativePath(outputRoot, menuEventPaletteCandidate.PalettePath),
-					PaletteSourceDescription = menuEventPaletteCandidate.Palette.SourceDescription,
-					Evidence = menuEventPaletteCandidate.Evidence,
-					DecodedPngFile = Path.Combine(candidateRootDirName, candidateFileName)
-				});
+					if (!decodedMobSprites.TryGetValue(item.Manifest.Index, out var candidateImage))
+					{
+						continue;
+					}
+
+					var candidateFileName = $"item_{item.Manifest.Index:D3}.png";
+					ImageWriter.WritePng(
+						Path.Combine(candidateRootDir, candidateFileName),
+						candidateImage,
+						paletteCandidate.Palette);
+					item.Manifest.PaletteCandidates.Add(new MobDataItemPaletteCandidateManifest
+					{
+						CandidateName = paletteCandidate.CandidateName,
+						PaletteOutputFile = Path.GetRelativePath(outputRoot, paletteCandidate.PalettePath),
+						PaletteSourceDescription = paletteCandidate.Palette.SourceDescription,
+						Evidence = paletteCandidate.Evidence,
+						DecodedPngFile = Path.Combine(candidateRootDirName, candidateFileName)
+					});
+				}
 			}
 		}
 
-		if (previewPalette is not null && decodedMobSprites.Count > 0 && entry.MobMetadataRecords.Count > 0)
+		if ((previewPalette is not null || hasGenericPaletteCandidates)
+			&& decodedMobSprites.Count > 0
+			&& entry.MobMetadataRecords.Count > 0)
 		{
 			var metadataDir = Path.Combine(entryDir, "metadata");
 			var framesDir = Path.Combine(metadataDir, "frames");
@@ -434,23 +446,29 @@ foreach (var inputFile in inputFiles)
 
 				if (options.WriteStripOutputs)
 				{
-					try
+					if (previewPalette is not null)
 					{
-						ImageWriter.WritePlacedHorizontalStripPng(
-							Path.Combine(metadataDir, explicitPngFileName),
-							explicitPlacedFrames,
-							explicitPlacement,
-							previewPalette);
-						record.Manifest.DecodedPngFile = explicitPngFileName;
-						record.Manifest.DecodedPaletteSource = previewPalette.SourceDescription;
-					}
-					catch (MobCanvasTooLargeException ex)
-					{
-						record.Manifest.DecodedExportError = ex.Message;
-						Console.Error.WriteLine($"Skipping explicit strip for {Path.GetFileName(inputFile)} entry {entry.Manifest.Index:D3} record {record.Manifest.Index:D3} ({record.Manifest.DecodedName}): {ex.Message}");
+						try
+						{
+							ImageWriter.WritePlacedHorizontalStripPng(
+								Path.Combine(metadataDir, explicitPngFileName),
+								explicitPlacedFrames,
+								explicitPlacement,
+								previewPalette);
+							record.Manifest.DecodedPngFile = explicitPngFileName;
+							record.Manifest.DecodedPaletteSource = previewPalette.SourceDescription;
+						}
+						catch (MobCanvasTooLargeException ex)
+						{
+							record.Manifest.DecodedExportError = ex.Message;
+							Console.Error.WriteLine($"Skipping explicit strip for {Path.GetFileName(inputFile)} entry {entry.Manifest.Index:D3} record {record.Manifest.Index:D3} ({record.Manifest.DecodedName}): {ex.Message}");
+						}
 					}
 
-					if (options.WriteSequenceRelativeOutputs && placedFrames is not null && sequencePlacement.HasValue)
+					if (previewPalette is not null
+						&& options.WriteSequenceRelativeOutputs
+						&& placedFrames is not null
+						&& sequencePlacement.HasValue)
 					{
 						try
 						{
@@ -469,32 +487,71 @@ foreach (var inputFile in inputFiles)
 					}
 				}
 
-				var explicitSequenceFrameDir = Path.Combine(framesDir, framesBaseName);
-				Directory.CreateDirectory(explicitSequenceFrameDir);
-
-				try
+				if (hasGenericPaletteCandidates)
 				{
-					for (var frameIndex = 0; frameIndex < explicitPlacedFrames.Count; frameIndex++)
+					var paletteCandidatesRootDirName = Path.Combine("metadata", "palette_candidates");
+
+					foreach (var paletteCandidate in externalPaletteCandidates)
 					{
-						var explicitPlacedFrame = explicitPlacedFrames[frameIndex];
-						var frameFileName = $"frame_{frameIndex:D3}_item_{explicitPlacedFrame.Element.DataItemIndex:D3}.png";
-						ImageWriter.WritePlacedFramePng(
-							Path.Combine(explicitSequenceFrameDir, frameFileName),
-							explicitPlacedFrame,
-							explicitPlacement,
-							previewPalette);
-						explicitPlacedFrame.Element.DecodedPlacementX = explicitPlacedFrame.PlacementX;
-						explicitPlacedFrame.Element.DecodedPlacementY = explicitPlacedFrame.PlacementY;
-						explicitPlacedFrame.Element.DecodedPngFile = Path.Combine("frames", framesBaseName, frameFileName);
+						var candidateDirName = Path.Combine(paletteCandidatesRootDirName, paletteCandidate.DirectoryName);
+						var candidateDir = Path.Combine(entryDir, candidateDirName);
+						Directory.CreateDirectory(candidateDir);
+
+						try
+						{
+							ImageWriter.WritePlacedHorizontalStripPng(
+								Path.Combine(candidateDir, explicitPngFileName),
+								explicitPlacedFrames,
+								explicitPlacement,
+								paletteCandidate.Palette);
+							record.Manifest.PaletteCandidates.Add(new MobDataItemPaletteCandidateManifest
+							{
+								CandidateName = paletteCandidate.CandidateName,
+								PaletteOutputFile = Path.GetRelativePath(outputRoot, paletteCandidate.PalettePath),
+								PaletteSourceDescription = paletteCandidate.Palette.SourceDescription,
+								Evidence = paletteCandidate.Evidence,
+								DecodedPngFile = Path.Combine(candidateDirName, explicitPngFileName)
+							});
+						}
+						catch (MobCanvasTooLargeException ex)
+						{
+							Console.Error.WriteLine($"Skipping palette candidate strip for {Path.GetFileName(inputFile)} entry {entry.Manifest.Index:D3} record {record.Manifest.Index:D3} ({record.Manifest.DecodedName}) under {paletteCandidate.CandidateName}: {ex.Message}");
+						}
 					}
 				}
-				catch (MobCanvasTooLargeException ex)
+
+				if (previewPalette is not null)
 				{
-					record.Manifest.DecodedExportError ??= ex.Message;
-					Console.Error.WriteLine($"Skipping explicit frame canvases for {Path.GetFileName(inputFile)} entry {entry.Manifest.Index:D3} record {record.Manifest.Index:D3} ({record.Manifest.DecodedName}): {ex.Message}");
+					var explicitSequenceFrameDir = Path.Combine(framesDir, framesBaseName);
+					Directory.CreateDirectory(explicitSequenceFrameDir);
+
+					try
+					{
+						for (var frameIndex = 0; frameIndex < explicitPlacedFrames.Count; frameIndex++)
+						{
+							var explicitPlacedFrame = explicitPlacedFrames[frameIndex];
+							var frameFileName = $"frame_{frameIndex:D3}_item_{explicitPlacedFrame.Element.DataItemIndex:D3}.png";
+							ImageWriter.WritePlacedFramePng(
+								Path.Combine(explicitSequenceFrameDir, frameFileName),
+								explicitPlacedFrame,
+								explicitPlacement,
+								previewPalette);
+							explicitPlacedFrame.Element.DecodedPlacementX = explicitPlacedFrame.PlacementX;
+							explicitPlacedFrame.Element.DecodedPlacementY = explicitPlacedFrame.PlacementY;
+							explicitPlacedFrame.Element.DecodedPngFile = Path.Combine("frames", framesBaseName, frameFileName);
+						}
+					}
+					catch (MobCanvasTooLargeException ex)
+					{
+						record.Manifest.DecodedExportError ??= ex.Message;
+						Console.Error.WriteLine($"Skipping explicit frame canvases for {Path.GetFileName(inputFile)} entry {entry.Manifest.Index:D3} record {record.Manifest.Index:D3} ({record.Manifest.DecodedName}): {ex.Message}");
+					}
 				}
 
-				if (options.WriteSequenceRelativeOutputs && placedFrames is not null && sequencePlacement.HasValue)
+				if (previewPalette is not null
+					&& options.WriteSequenceRelativeOutputs
+					&& placedFrames is not null
+					&& sequencePlacement.HasValue)
 				{
 					var sequenceFrameDir = Path.Combine(sequenceFramesDir, framesBaseName);
 					Directory.CreateDirectory(sequenceFrameDir);
@@ -1077,6 +1134,40 @@ static MenuEventPaletteCandidate? TryLoadDiskresMenuPaletteCandidate(string samp
 		"Selector 1/0 resolves DISKRES.SPB entry 1 (GAME_OVER) subresource 0 before the outer full-palette upload at 0x18010.");
 }
 
+static List<ExternalPaletteCandidate> BuildExternalPaletteCandidates(
+	IReadOnlyList<TransitionScenePaletteCandidate> transitionScenePaletteCandidates,
+	MenuEventPaletteCandidate? menuEventPaletteCandidate)
+{
+	var candidates = new List<ExternalPaletteCandidate>(
+		transitionScenePaletteCandidates.Count + (menuEventPaletteCandidate is null ? 0 : 1));
+
+	for (var candidateIndex = 0; candidateIndex < transitionScenePaletteCandidates.Count; candidateIndex++)
+	{
+		var candidate = transitionScenePaletteCandidates[candidateIndex];
+		var matchedFiles = candidate.SourceFiles.Count > 0
+			? string.Join(", ", candidate.SourceFiles)
+			: "transition analysis";
+		candidates.Add(new ExternalPaletteCandidate(
+			candidate.SceneName,
+			$"scene_{candidateIndex:D3}_{SanitizeFileComponent(candidate.SceneName)}",
+			candidate.PalettePath,
+			candidate.Palette,
+			$"Transition-backed scene palette candidate matched in {matchedFiles}."));
+	}
+
+	if (menuEventPaletteCandidate is not null)
+	{
+		candidates.Add(new ExternalPaletteCandidate(
+			menuEventPaletteCandidate.CandidateName,
+			$"menu_{SanitizeFileComponent(menuEventPaletteCandidate.CandidateName)}",
+			menuEventPaletteCandidate.PalettePath,
+			menuEventPaletteCandidate.Palette,
+			menuEventPaletteCandidate.Evidence));
+	}
+
+	return candidates;
+}
+
 static void ResetDirectory(string path)
 {
 	if (Directory.Exists(path))
@@ -1125,10 +1216,31 @@ static void WriteCharDatInspectionOutput(
 static void WriteTransitionFileInspectionOutput(
 	string inputFile,
 	string outputDir,
+	string sampleRoot,
 	JsonSerializerOptions jsonOptions,
 	bool writeBinaryOutputs)
 {
-	var inspection = TransitionFileInspector.Inspect(inputFile, retainDecompressedPayload: writeBinaryOutputs);
+	ArchiveInspection? objectMobInspection = null;
+	if (Path.GetFileName(inputFile).Equals("SAGA.BIN", StringComparison.OrdinalIgnoreCase))
+	{
+		var objectMobPath = Path.Combine(sampleRoot, "OBJECT.MOB");
+		if (File.Exists(objectMobPath))
+		{
+			try
+			{
+				objectMobInspection = ArchiveInspector.Inspect(objectMobPath);
+			}
+			catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException)
+			{
+				Console.Error.WriteLine($"OBJECT.MOB alias enrichment skipped: {ex.Message}");
+			}
+		}
+	}
+
+	var inspection = TransitionFileInspector.Inspect(
+		inputFile,
+		retainDecompressedPayload: writeBinaryOutputs,
+		objectMobInspection);
 
 	foreach (var section in inspection.Sections)
 	{
@@ -3505,6 +3617,7 @@ static class TransitionFileInspector
 {
 	private const int CountHeaderOffset = 0;
 	private const int LzStreamOffset = 4;
+	private const int HeaderSize = 8;
 	private const int ScpRootCountOffset = 0;
 	private const int ScpRootTableOffset = 2;
 	private const int ScpRootRecordSize = 0x24;
@@ -3514,18 +3627,45 @@ static class TransitionFileInspector
 	private const int BinFirstSectionOffset = 2;
 	private const int BinFirstSectionEntrySize = 0x80;
 	private const int BinSecondSectionEntrySize = 0x44;
+	private const int BinPublishedSelectorEntrySize = 0x24;
+	private const int FirstKeyBlobSectionBaseOffset = 0x20;
+	private const int SecondKeyBlobSectionBaseOffset = 0x10E;
+	private const int SceneRecordNameLength = 0x20;
+	private const int TopLevelDescriptorNameLength = 0x20;
+	private const int TopLevelDescriptorField20Offset = 0x20;
+	private const int TopLevelDescriptorField24Offset = 0x24;
+	private const int SceneRecordSelectorOffset = 0x24;
+	private const int SceneRecordFlagsOffset = 0x28;
+	private const int SceneRecordPositionXOffset = 0x2E;
+	private const int SceneRecordPositionYOffset = 0x30;
+	private const int SceneRecordField32Offset = 0x32;
+	private const int SceneRecordField34Offset = 0x34;
+	private const int SceneRecordField36Offset = 0x36;
+	private const int SceneRecordField38Offset = 0x38;
+	private const int SceneRecordField3AOffset = 0x3A;
+	private const int SceneRecordField3COffset = 0x3C;
+	private const int SecondKeyPrelude44SectionIndex = 0;
+	private const int SecondKeyInteraction4CSectionIndex = 1;
+	private const int SecondKeySceneRecordSectionIndex = 2;
+	private const int SecondKeyAnchorSectionIndex = 3;
+	private static readonly int[] FirstKeyBlobSectionEntrySizes = { 0x44, 0x24, 0x30, 0x08, 0x04 };
+	private static readonly int[] SecondKeyBlobSectionEntrySizes = { 0x44, 0x4C, 0x44, 0x38 };
 	private static readonly Encoding KoreanEncoding = Encoding.GetEncoding(949);
 
-	public static TransitionFileInspection Inspect(string path, bool retainDecompressedPayload)
+	public static TransitionFileInspection Inspect(
+		string path,
+		bool retainDecompressedPayload,
+		ArchiveInspection? objectMobInspection = null)
 	{
 		var data = File.ReadAllBytes(path);
-		if (data.Length < LzStreamOffset + 1)
+		if (data.Length < HeaderSize)
 		{
 			throw new InvalidDataException($"{path} is smaller than the transition-file decode header.");
 		}
 
-		var lzDecodedSize = ReadUInt32(data, CountHeaderOffset);
-		if (!FamInspector.TryDecompressLz(data, CountHeaderOffset, out var decoded, out var bytesConsumed, out var error))
+		var allocationDecodedSize = ReadUInt32(data, CountHeaderOffset);
+		var lzDecodedSize = ReadUInt32(data, LzStreamOffset);
+		if (!FamInspector.TryDecompressLz(data, LzStreamOffset, out var decoded, out var bytesConsumed, out var error))
 		{
 			throw new InvalidDataException($"Failed to decompress {Path.GetFileName(path)}: {error}");
 		}
@@ -3533,12 +3673,20 @@ static class TransitionFileInspector
 		var fileName = Path.GetFileName(path);
 		if (fileName.Equals("SAGA.SCP", StringComparison.OrdinalIgnoreCase))
 		{
-			return InspectSagaScp(path, data, decoded, lzDecodedSize, bytesConsumed, retainDecompressedPayload);
+			return InspectSagaScp(path, data, decoded, allocationDecodedSize, lzDecodedSize, bytesConsumed, retainDecompressedPayload);
 		}
 
 		if (fileName.Equals("SAGA.BIN", StringComparison.OrdinalIgnoreCase))
 		{
-			return InspectSagaBin(path, data, decoded, lzDecodedSize, bytesConsumed, retainDecompressedPayload);
+			return InspectSagaBin(
+				path,
+				data,
+				decoded,
+				allocationDecodedSize,
+				lzDecodedSize,
+				bytesConsumed,
+				retainDecompressedPayload,
+				objectMobInspection);
 		}
 
 		throw new InvalidDataException($"Unsupported transition file: {path}");
@@ -3548,6 +3696,7 @@ static class TransitionFileInspector
 		string path,
 		byte[] encoded,
 		byte[] decoded,
+		uint allocationDecodedSize,
 		uint lzDecodedSize,
 		int bytesConsumed,
 		bool retainDecompressedPayload)
@@ -3572,6 +3721,7 @@ static class TransitionFileInspector
 			FullPath = path,
 			Variant = "SAGA.SCP",
 			CountHeaderOffset = CountHeaderOffset,
+			AllocationDecodedSize = allocationDecodedSize,
 			LzStreamOffset = LzStreamOffset,
 			LzDecodedSize = lzDecodedSize,
 			LzBytesConsumed = bytesConsumed,
@@ -3585,7 +3735,7 @@ static class TransitionFileInspector
 		return new TransitionFileInspection(
 			manifest,
 			sections,
-			encoded.AsSpan(0, LzStreamOffset).ToArray(),
+			encoded.AsSpan(0, HeaderSize).ToArray(),
 			retainDecompressedPayload ? decoded : null,
 			null);
 	}
@@ -3594,9 +3744,11 @@ static class TransitionFileInspector
 		string path,
 		byte[] encoded,
 		byte[] decoded,
+		uint allocationDecodedSize,
 		uint lzDecodedSize,
 		int bytesConsumed,
-		bool retainDecompressedPayload)
+		bool retainDecompressedPayload,
+		ArchiveInspection? objectMobInspection)
 	{
 		var firstSectionCount = ReadUInt16(decoded, BinFirstSectionCountOffset);
 		var firstSectionLength = checked(firstSectionCount * BinFirstSectionEntrySize);
@@ -3611,7 +3763,8 @@ static class TransitionFileInspector
 
 		var publishedSelectorCount = ReadUInt16(decoded, publishedSelectorCountOffset);
 		var publishedSelectorOffset = publishedSelectorCountOffset + 2;
-		EnsureAvailable(decoded, publishedSelectorOffset, 0, path, "SAGA.BIN published selector table");
+		var publishedSelectorTableLength = checked(publishedSelectorCount * BinPublishedSelectorEntrySize);
+		EnsureAvailable(decoded, publishedSelectorOffset, publishedSelectorTableLength, path, "SAGA.BIN published selector table");
 
 		var firstSection = BuildSection(
 			decoded,
@@ -3625,7 +3778,22 @@ static class TransitionFileInspector
 			secondSectionOffset,
 			secondSectionCount,
 			BinSecondSectionEntrySize);
-		var sections = new List<TransitionSectionInspection> { firstSection, secondSection };
+		var publishedSelectorSection = BuildSection(
+			decoded,
+			"published_0x24_records",
+			publishedSelectorOffset,
+			publishedSelectorCount,
+			BinPublishedSelectorEntrySize,
+			blobOffsetFieldOffset: ScpBlobOffsetFieldOffset,
+			blobOffsetBias: 0,
+			blobPointerBaseOffset: publishedSelectorOffset,
+			minimumBlobDataOffset: checked(publishedSelectorOffset + publishedSelectorTableLength));
+		AnalyzePublishedSelectorEntries(
+			decoded,
+			publishedSelectorSection,
+			secondSection,
+			objectMobInspection is null ? null : BuildObjectMobEntries(objectMobInspection));
+		var sections = new List<TransitionSectionInspection> { firstSection, secondSection, publishedSelectorSection };
 		var publishedSelectorRegion = decoded.AsSpan(publishedSelectorOffset).ToArray();
 
 		var manifest = new TransitionFileManifest
@@ -3634,6 +3802,7 @@ static class TransitionFileInspector
 			FullPath = path,
 			Variant = "SAGA.BIN",
 			CountHeaderOffset = CountHeaderOffset,
+			AllocationDecodedSize = allocationDecodedSize,
 			LzStreamOffset = LzStreamOffset,
 			LzDecodedSize = lzDecodedSize,
 			LzBytesConsumed = bytesConsumed,
@@ -3654,7 +3823,7 @@ static class TransitionFileInspector
 		return new TransitionFileInspection(
 			manifest,
 			sections,
-			encoded.AsSpan(0, LzStreamOffset).ToArray(),
+			encoded.AsSpan(0, HeaderSize).ToArray(),
 			retainDecompressedPayload ? decoded : null,
 			publishedSelectorRegion);
 	}
@@ -3667,6 +3836,7 @@ static class TransitionFileInspector
 		int entrySize,
 		int? blobOffsetFieldOffset = null,
 		int blobOffsetBias = 0,
+		int blobPointerBaseOffset = 0,
 		int? minimumBlobDataOffset = null)
 	{
 		var tableLength = checked(entryCount * entrySize);
@@ -3686,7 +3856,7 @@ static class TransitionFileInspector
 			{
 				var candidate = ReadUInt32(payload, fieldOffset);
 				blobFieldValue = candidate;
-				var candidateOffset = (long)candidate + blobOffsetBias;
+				var candidateOffset = (long)blobPointerBaseOffset + candidate + blobOffsetBias;
 				if (candidateOffset >= 0
 					&& candidateOffset < decoded.Length
 					&& (!minimumBlobDataOffset.HasValue || candidateOffset >= minimumBlobDataOffset.Value))
@@ -3721,6 +3891,294 @@ static class TransitionFileInspector
 			},
 			entries,
 			decoded.AsSpan(tableOffset, tableLength).ToArray());
+	}
+
+	private static void AnalyzePublishedSelectorEntries(
+		byte[] decoded,
+		TransitionSectionInspection publishedSelectorSection,
+		TransitionSectionInspection secondSection,
+		IReadOnlyDictionary<int, ObjectMobArchiveEntry>? objectMobEntries)
+	{
+		var visibleTopLevelDescriptors = BuildVisibleTopLevelDescriptors(secondSection);
+		foreach (var entry in publishedSelectorSection.Entries)
+		{
+			if (entry.Manifest.BlobDataOffsetCandidate is not int blobOffset)
+			{
+				continue;
+			}
+
+			entry.Manifest.PublishedSelectorAnalysis = AnalyzePublishedSelectorEntry(
+				decoded,
+				blobOffset,
+				visibleTopLevelDescriptors,
+				secondSection.Manifest.EntryCount,
+				objectMobEntries);
+		}
+	}
+
+	private static TransitionPublishedSelectorAnalysisManifest AnalyzePublishedSelectorEntry(
+		byte[] decoded,
+		int blobOffset,
+		IReadOnlyDictionary<int, VisibleTopLevelDescriptor> visibleTopLevelDescriptors,
+		int visibleTopLevelDescriptorCount,
+		IReadOnlyDictionary<int, ObjectMobArchiveEntry>? objectMobEntries)
+	{
+		var firstKeySections = ParseCountedSections(
+			decoded,
+			checked(blobOffset + FirstKeyBlobSectionBaseOffset),
+			FirstKeyBlobSectionEntrySizes,
+			$"published selector blob 0x{blobOffset:X}");
+		var aliasSection = firstKeySections[^1];
+		var aliasValues = new List<int>(aliasSection.EntryCount);
+		for (var index = 0; index < aliasSection.EntryCount; index++)
+		{
+			aliasValues.Add(checked((int)ReadUInt32(decoded, checked(aliasSection.DataOffset + (index * aliasSection.EntrySize)))));
+		}
+
+		var aliasesBeyondVisibleTransitionDescriptors = aliasValues
+			.Where(value => value < 0 || value >= visibleTopLevelDescriptorCount)
+			.Distinct()
+			.OrderBy(value => value)
+			.ToList();
+
+		var aliasesOutsideObjectMobEntryTable = new List<int>();
+		var distinctObjectMobEntries = new List<ObjectMobArchiveEntryManifest>();
+		if (objectMobEntries is not null)
+		{
+			foreach (var aliasValue in aliasValues.Distinct().OrderBy(value => value))
+			{
+				if (objectMobEntries.TryGetValue(aliasValue, out var objectMobEntry))
+				{
+					distinctObjectMobEntries.Add(BuildObjectMobEntryManifest(objectMobEntry));
+				}
+				else
+				{
+					aliasesOutsideObjectMobEntryTable.Add(aliasValue);
+				}
+			}
+		}
+
+		var subsceneCountOffset = aliasSection.EndOffset;
+		EnsureAvailable(decoded, subsceneCountOffset, 2, "published selector blob", "subscene count");
+		var subsceneCount = ReadUInt16(decoded, subsceneCountOffset);
+		var subsceneTableOffset = subsceneCountOffset + 2;
+		EnsureAvailable(
+			decoded,
+			subsceneTableOffset,
+			checked(subsceneCount * BinPublishedSelectorEntrySize),
+			"published selector blob",
+			"subscene table");
+
+		var subscenes = new List<TransitionPublishedSubsceneManifest>(subsceneCount);
+		for (var index = 0; index < subsceneCount; index++)
+		{
+			var entryOffset = checked(subsceneTableOffset + (index * BinPublishedSelectorEntrySize));
+			var subsceneName = DecodeName(decoded, entryOffset, SceneRecordNameLength);
+			var subsceneBlobOffset = checked(subsceneTableOffset + (int)ReadUInt32(decoded, entryOffset + ScpBlobOffsetFieldOffset));
+
+			try
+			{
+				subscenes.Add(AnalyzePublishedSubscene(
+					decoded,
+					index,
+					subsceneName,
+					subsceneBlobOffset,
+					aliasValues,
+					visibleTopLevelDescriptors,
+					objectMobEntries));
+			}
+			catch (Exception ex)
+			{
+				subscenes.Add(new TransitionPublishedSubsceneManifest
+					{
+						Index = index,
+						Name = subsceneName,
+						BlobOffset = subsceneBlobOffset,
+						ParseError = ex.Message,
+						SceneRecords = new List<TransitionSceneRecordAnalysisManifest>()
+					});
+			}
+		}
+
+		return new TransitionPublishedSelectorAnalysisManifest
+		{
+			BlobOffset = blobOffset,
+			AliasCount = aliasValues.Count,
+			VisibleTopLevelDescriptorCount = visibleTopLevelDescriptorCount,
+			AliasValues = aliasValues,
+			AliasesBeyondVisibleTransitionDescriptors = aliasesBeyondVisibleTransitionDescriptors,
+			ObjectMobEntryCount = objectMobEntries?.Count,
+			AliasesOutsideObjectMobEntryTable = aliasesOutsideObjectMobEntryTable,
+			DistinctObjectMobEntries = distinctObjectMobEntries,
+			SubsceneCount = subsceneCount,
+			Subscenes = subscenes
+		};
+	}
+
+	private static TransitionPublishedSubsceneManifest AnalyzePublishedSubscene(
+		byte[] decoded,
+		int subsceneIndex,
+		string subsceneName,
+		int blobOffset,
+		IReadOnlyList<int> aliasValues,
+		IReadOnlyDictionary<int, VisibleTopLevelDescriptor> visibleTopLevelDescriptors,
+		IReadOnlyDictionary<int, ObjectMobArchiveEntry>? objectMobEntries)
+	{
+		var secondKeySections = ParseCountedSections(
+			decoded,
+			checked(blobOffset + SecondKeyBlobSectionBaseOffset),
+			SecondKeyBlobSectionEntrySizes,
+			$"subscene blob 0x{blobOffset:X}");
+		var sceneRecordSection = secondKeySections[SecondKeySceneRecordSectionIndex];
+		var sceneRecords = new List<TransitionSceneRecordAnalysisManifest>(sceneRecordSection.EntryCount);
+
+		for (var index = 0; index < sceneRecordSection.EntryCount; index++)
+		{
+			var recordOffset = checked(sceneRecordSection.DataOffset + (index * sceneRecordSection.EntrySize));
+			EnsureAvailable(decoded, recordOffset, sceneRecordSection.EntrySize, "subscene blob", "scene record");
+			var selector = checked((int)ReadUInt32(decoded, recordOffset + SceneRecordSelectorOffset));
+			int? aliasValue = selector >= 0 && selector < aliasValues.Count
+				? aliasValues[selector]
+				: null;
+			VisibleTopLevelDescriptor? visibleDescriptor = null;
+			if (aliasValue is int descriptorIndex)
+			{
+				visibleTopLevelDescriptors.TryGetValue(descriptorIndex, out visibleDescriptor);
+			}
+
+			ObjectMobArchiveEntryManifest? objectMobEntry = null;
+			if (aliasValue is int objectMobEntryIndex
+				&& objectMobEntries is not null
+				&& objectMobEntries.TryGetValue(objectMobEntryIndex, out var resolvedObjectMobEntry))
+			{
+				objectMobEntry = BuildObjectMobEntryManifest(resolvedObjectMobEntry);
+			}
+
+			sceneRecords.Add(new TransitionSceneRecordAnalysisManifest
+			{
+				Index = index,
+				RecordOffset = recordOffset,
+				Name = DecodeName(decoded, recordOffset, SceneRecordNameLength),
+				Selector = selector,
+				AliasValue = aliasValue,
+				VisibleTopLevelDescriptorIndex = visibleDescriptor?.Index,
+				VisibleTopLevelDescriptorName = visibleDescriptor?.Name,
+				VisibleTopLevelDescriptorField20 = visibleDescriptor?.Field20,
+				VisibleTopLevelDescriptorField24 = visibleDescriptor?.Field24,
+				ObjectMobEntry = objectMobEntry,
+				Flags28 = decoded[recordOffset + SceneRecordFlagsOffset],
+				PositionX = ReadUInt16(decoded, recordOffset + SceneRecordPositionXOffset),
+				PositionY = ReadUInt16(decoded, recordOffset + SceneRecordPositionYOffset),
+				Field32 = ReadUInt16(decoded, recordOffset + SceneRecordField32Offset),
+				Field34 = ReadUInt16(decoded, recordOffset + SceneRecordField34Offset),
+				Field36 = ReadUInt16(decoded, recordOffset + SceneRecordField36Offset),
+				Field38 = ReadUInt16(decoded, recordOffset + SceneRecordField38Offset),
+				Field3A = ReadUInt16(decoded, recordOffset + SceneRecordField3AOffset),
+				Field3C = ReadUInt32(decoded, recordOffset + SceneRecordField3COffset)
+			});
+		}
+
+		return new TransitionPublishedSubsceneManifest
+		{
+			Index = subsceneIndex,
+			Name = subsceneName,
+			BlobOffset = blobOffset,
+			Prelude44Count = secondKeySections[SecondKeyPrelude44SectionIndex].EntryCount,
+			Interaction4CCount = secondKeySections[SecondKeyInteraction4CSectionIndex].EntryCount,
+			SceneRecordCount = sceneRecordSection.EntryCount,
+			AnchorCount = secondKeySections[SecondKeyAnchorSectionIndex].EntryCount,
+			SceneRecords = sceneRecords
+		};
+	}
+
+	private static Dictionary<int, VisibleTopLevelDescriptor> BuildVisibleTopLevelDescriptors(TransitionSectionInspection secondSection)
+	{
+		var descriptors = new Dictionary<int, VisibleTopLevelDescriptor>(secondSection.Entries.Count);
+		foreach (var entry in secondSection.Entries)
+		{
+			var payload = entry.Payload;
+			if (payload.Length < BinSecondSectionEntrySize)
+			{
+				continue;
+			}
+
+			descriptors[entry.Manifest.Index] = new VisibleTopLevelDescriptor(
+				entry.Manifest.Index,
+				DecodeName(payload, 0, TopLevelDescriptorNameLength),
+				ReadUInt32(payload, TopLevelDescriptorField20Offset),
+				ReadUInt32(payload, TopLevelDescriptorField24Offset));
+		}
+
+		return descriptors;
+	}
+
+	private static Dictionary<int, ObjectMobArchiveEntry> BuildObjectMobEntries(ArchiveInspection objectMobInspection)
+	{
+		var entries = new Dictionary<int, ObjectMobArchiveEntry>(objectMobInspection.Entries.Count);
+		foreach (var entry in objectMobInspection.Entries)
+		{
+			entries[entry.Manifest.Index] = new ObjectMobArchiveEntry(
+				entry.Manifest.Index,
+				entry.Manifest.DecodedName,
+				entry.Manifest.DataOffset,
+				entry.Manifest.MobDataOffset,
+				entry.MobMetadataRecords.Count,
+				entry.MobDataItems.Count,
+				entry.MobDataItems.Any(item => item.Manifest.IsLikelyLiveWorldSprite)
+					? ArchiveInspector.LiveWorldSpriteDataItemIndex
+					: null);
+		}
+
+		return entries;
+	}
+
+	private static ObjectMobArchiveEntryManifest BuildObjectMobEntryManifest(ObjectMobArchiveEntry entry)
+	{
+		return new ObjectMobArchiveEntryManifest
+		{
+			Index = entry.Index,
+			Name = entry.Name,
+			MetadataBlockOffset = entry.MetadataBlockOffset,
+			DataBlockOffset = entry.DataBlockOffset,
+			MetadataRecordCount = entry.MetadataRecordCount,
+			DataItemCount = entry.DataItemCount,
+			LikelyLiveWorldSpriteDataItemIndex = entry.LikelyLiveWorldSpriteDataItemIndex
+		};
+	}
+
+	private static List<CountedSectionParse> ParseCountedSections(
+		byte[] decoded,
+		int startOffset,
+		IReadOnlyList<int> entrySizes,
+		string description)
+	{
+		var sections = new List<CountedSectionParse>(entrySizes.Count);
+		var cursor = startOffset;
+		for (var index = 0; index < entrySizes.Count; index++)
+		{
+			EnsureAvailable(decoded, cursor, 2, description, $"section {index} count");
+			var entryCount = ReadUInt16(decoded, cursor);
+			var dataOffset = cursor + 2;
+			var byteLength = checked(entryCount * entrySizes[index]);
+			EnsureAvailable(decoded, dataOffset, byteLength, description, $"section {index} data");
+			sections.Add(new CountedSectionParse(entrySizes[index], entryCount, dataOffset));
+			cursor = checked(dataOffset + byteLength);
+		}
+
+		return sections;
+	}
+
+	private static string DecodeName(byte[] data, int offset, int maxLength)
+	{
+		EnsureAvailable(data, offset, maxLength, nameof(TransitionFileInspector), "name decode");
+		var zeroIndex = Array.IndexOf(data, (byte)0, offset, maxLength);
+		var count = zeroIndex >= 0 ? zeroIndex - offset : maxLength;
+		if (count <= 0)
+		{
+			return string.Empty;
+		}
+
+		return KoreanEncoding.GetString(data, offset, count).Trim();
 	}
 
 	private static string? BuildTextPreview(byte[] payload)
@@ -3772,6 +4230,21 @@ static class TransitionFileInspector
 	{
 		return BitConverter.ToUInt32(data, offset);
 	}
+
+	private sealed record CountedSectionParse(int EntrySize, int EntryCount, int DataOffset)
+	{
+		public int EndOffset => checked(DataOffset + (EntryCount * EntrySize));
+	}
+
+	private sealed record VisibleTopLevelDescriptor(int Index, string Name, uint Field20, uint Field24);
+	private sealed record ObjectMobArchiveEntry(
+		int Index,
+		string Name,
+		uint MetadataBlockOffset,
+		uint? DataBlockOffset,
+		int MetadataRecordCount,
+		int DataItemCount,
+		int? LikelyLiveWorldSpriteDataItemIndex);
 }
 
 sealed record ArchiveInspection(
@@ -3845,6 +4318,13 @@ sealed record TransitionScenePaletteCandidate(
 	string PalettePath,
 	IndexedPalette Palette,
 	IReadOnlyList<string> SourceFiles);
+
+sealed record ExternalPaletteCandidate(
+	string CandidateName,
+	string DirectoryName,
+	string PalettePath,
+	IndexedPalette Palette,
+	string Evidence);
 
 sealed record MenuEventPaletteCandidate(
 	string CandidateName,
@@ -3948,6 +4428,7 @@ sealed class TransitionFileManifest
 	public required string FullPath { get; init; }
 	public required string Variant { get; init; }
 	public required int CountHeaderOffset { get; init; }
+	public required uint AllocationDecodedSize { get; init; }
 	public required int LzStreamOffset { get; init; }
 	public required uint LzDecodedSize { get; init; }
 	public required int LzBytesConsumed { get; init; }
@@ -3988,7 +4469,69 @@ sealed class TransitionSectionEntryManifest
 	public string? TextPreview { get; init; }
 	public uint? BlobOffsetField { get; init; }
 	public int? BlobDataOffsetCandidate { get; init; }
+	public TransitionPublishedSelectorAnalysisManifest? PublishedSelectorAnalysis { get; set; }
 	public string? OutputFile { get; set; }
+}
+
+sealed class TransitionPublishedSelectorAnalysisManifest
+{
+	public required int BlobOffset { get; init; }
+	public required int AliasCount { get; init; }
+	public required int VisibleTopLevelDescriptorCount { get; init; }
+	public required List<int> AliasValues { get; init; }
+	public required List<int> AliasesBeyondVisibleTransitionDescriptors { get; init; }
+	public int? ObjectMobEntryCount { get; init; }
+	public required List<int> AliasesOutsideObjectMobEntryTable { get; init; }
+	public required List<ObjectMobArchiveEntryManifest> DistinctObjectMobEntries { get; init; }
+	public required int SubsceneCount { get; init; }
+	public required List<TransitionPublishedSubsceneManifest> Subscenes { get; init; }
+}
+
+sealed class TransitionPublishedSubsceneManifest
+{
+	public required int Index { get; init; }
+	public required string Name { get; init; }
+	public required int BlobOffset { get; init; }
+	public int? Prelude44Count { get; init; }
+	public int? Interaction4CCount { get; init; }
+	public int? SceneRecordCount { get; init; }
+	public int? AnchorCount { get; init; }
+	public string? ParseError { get; init; }
+	public required List<TransitionSceneRecordAnalysisManifest> SceneRecords { get; init; }
+}
+
+sealed class TransitionSceneRecordAnalysisManifest
+{
+	public required int Index { get; init; }
+	public required int RecordOffset { get; init; }
+	public required string Name { get; init; }
+	public required int Selector { get; init; }
+	public int? AliasValue { get; init; }
+	public int? VisibleTopLevelDescriptorIndex { get; init; }
+	public string? VisibleTopLevelDescriptorName { get; init; }
+	public uint? VisibleTopLevelDescriptorField20 { get; init; }
+	public uint? VisibleTopLevelDescriptorField24 { get; init; }
+	public ObjectMobArchiveEntryManifest? ObjectMobEntry { get; init; }
+	public required byte Flags28 { get; init; }
+	public required ushort PositionX { get; init; }
+	public required ushort PositionY { get; init; }
+	public required ushort Field32 { get; init; }
+	public required ushort Field34 { get; init; }
+	public required ushort Field36 { get; init; }
+	public required ushort Field38 { get; init; }
+	public required ushort Field3A { get; init; }
+	public required uint Field3C { get; init; }
+}
+
+sealed class ObjectMobArchiveEntryManifest
+{
+	public required int Index { get; init; }
+	public required string Name { get; init; }
+	public required uint MetadataBlockOffset { get; init; }
+	public uint? DataBlockOffset { get; init; }
+	public required int MetadataRecordCount { get; init; }
+	public required int DataItemCount { get; init; }
+	public int? LikelyLiveWorldSpriteDataItemIndex { get; init; }
 }
 
 sealed class ArchiveEntryManifest
@@ -4119,6 +4662,7 @@ sealed class MobMetadataRecordManifest
 	public string? AlternateDecodedPlacementMode { get; set; }
 	public string? AlternateDecodedPngFile { get; set; }
 	public string? AlternateDecodedExportError { get; set; }
+	public List<MobDataItemPaletteCandidateManifest> PaletteCandidates { get; } = new();
 	public List<MobMetadataElementManifest> Elements { get; } = new();
 }
 
