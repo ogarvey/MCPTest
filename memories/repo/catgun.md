@@ -1,0 +1,53 @@
+- CatGun: `FUN_0002a630` loads `map/*.dat`, then copies header fields to globals and rebases many internal offsets with `FUN_0002acd0`.
+- Selector mapping confirmed: `1=intro`, `2=highscor`, `3=charsel`, `4=leader`, `5=<DAT_0006558c>`, `0=lv%02ds%d`.
+- `DAT_000883e0` is a `0x28`-byte named resource table searched by `FUN_0002c150`; observed names include `INTROBCK`, `LEVELS`, `FONT`, `LEADER`.
+- Confirmed on `Samples/map/intro.dat` and `Samples/map/charsel.dat`: extracted `.dat` files start with repeated `HZRD` and do not directly match the in-memory layout expected by `FUN_0002a630`; verify extraction source before writing a parser against them.
+- `FUN_000110a0` is the main downstream DAT-content dispatcher; for DAT type `8` it uses `FUN_0002c470` and `FUN_0002c360` to scan rebased layer cell arrays in `DAT_000655a4[]` and resolve them through the named resource table at `DAT_000883e0`.
+- `DAT_0006557c` behaves as banked palette data, not raw image/tile payload: multiple callers use `index * 0x300`, and `FUN_0003dd90` is a palette transition helper.
+- If `0xF9C0` is the start of a common payload region in raw `.dat` files, the code does not reference it directly; payload access is indirect through rebased offsets and named resource entries.
+- `FUN_0002c360` uses two dispatch tables: a static table at `0x3AF3C` with names like `PLT0..3`, `*_PICKUP`, `SCROLL_BORDER`, `KILL`, `END`, and powerups; and a second table chosen via `DAT_0006027c` through `0x60C0C`.
+- `lv01s1.dat` contains second-stage level resource names from that code table, including `PIPE_DRIP`, `PIPE_LEAK_HOR`, `PIPE_LEAK_VER`, `SLIMER`, `STEEL_DRIP0`, `STEEL_DRIP1`, and `TEXTURE`.
+- `FUN_00035000` resolves `INTROBCK`; its entry's `+4` field points to a secondary structure whose `+0x24` is stored in `DAT_00092764` and `+0x54` in `DAT_00092734`. `FUN_00036A00` uses `DAT_00092734` as four `0x400`-short planes for coordinate derivation.
+- The extracted samples contain readable resource-name pools on disk (`intro.dat` around `0x12D82B`, `lv01s1.dat` around `0x106F40`), but the exact raw record format that expands into in-memory `0x28` resource entries is still unresolved.
+- Level-1 second-stage table at `0x13F38` maps `SLIMER` to handler `0x144D0`; that stub calls `FUN_000136E0` and `FUN_0002C2C0`, then adjusts object state fields, so `SLIMER` is a spawned gameplay object/actor path.
+- `TEXTURE` exists in the raw `lv01s1.dat` string pool but is not present in the level-1 `0x13F38` dispatch table; it likely uses a different lookup path than the `FUN_0002C360` second-stage table.
+- Immediate-pre-pool raw-directory tests on `lv01s1.dat` failed for simple 16-bit/32-bit relative-name-offset and low-file-offset hypotheses, so the extracted file still does not expose a trivially direct on-disk form of the in-memory `DAT_000883E0` entry table.
+- `FUN_00037640` mounts `GHX:/CATGUN.BLK` (fallback `CATGUN.BLK`), then reads `X:/POWER.CFG`; archive contents are exposed through a virtual filesystem layer.
+- `FUN_0004ff50` reads an 8-byte BLK header into `DAT_0009ff4c/50`, then reads the remaining directory blob into `DAT_0009ff54`; `FUN_0004feb0` walks that directory in `0x30`-byte records.
+- BLK directory record shape recovered from code: name at `+0x00`, file offset at `+0x28`, file size at `+0x2c`.
+- Archive-hit DAT load path is raw: `FUN_0004fd90` -> `FUN_0004feb0` -> `FUN_0005574c` seek -> `FUN_00053da7` buffered copy. `FUN_00053da7` bottoms out in DOS read (`FUN_0005876f`), and seek bottoms out in DOS lseek (`FUN_000586fc`).
+- No decompression/deobfuscation or wrapper stripping was found in the inspected BLK-backed `map/*.dat` load path; if current samples still mismatch `FUN_0002a630`, either the samples are not exact BLK entry bytes or the BLK directory points to an inner payload slice that current extraction did not respect.
+- Direct BLK validation on `Samples/CATGUN.BLK`: header dwords are `0x21` entries and first-data-offset `0x640`; with `33 * 0x30 + 8 = 0x638`, the directory is padded/aligned to `0x640`.
+- Parsed BLK records match the code-derived layout exactly: `+0x00..+0x27` path, `+0x28` offset, `+0x2c` size. Example: `map/intro.dat -> 0x27C840 / 0x144C9D`, `map/lv01s1.dat -> 0x4C7660 / 0x1DDBC5`.
+- The loose extracted samples are not raw BLK slices even when sizes match exactly. Raw BLK `map/intro.dat` begins `02 00 00 00 ...`, while extracted `Samples/map/intro.dat` begins with repeated `HZRD`; same mismatch confirmed for `charsel.dat`, `lv01s1.dat`, and even `edfont.lbm`.
+- For `map/intro.dat`, the extracted file's opening `HZRD` bytes first occur at offset `0x9c` inside the raw BLK entry, but the extracted file is not a simple rotation of the raw entry around that offset.
+- Treat `Samples/CATGUN.BLK` as the canonical runtime source for extractor work; the current loose extracted files are a transformed or derived artifact, not the bytes consumed by `FUN_0002a630`.
+- `DogKnife` now contains a BLK-aware raw extractor: `dotnet run --project DOS/CatGun/DogKnife/DogKnife.csproj` defaults to `Samples/CATGUN.BLK` and writes the canonical raw entries to `DOS/CatGun/TestOutput/BLK_Raw`.
+- `DogKnife` now also has a first-pass DAT parser: `dotnet run --project DOS/CatGun/DogKnife/DogKnife.csproj -- --dump-dat <raw-dat-path>`.
+- Header fields directly grounded from `FUN_0002a630` and now parsed in code: type `0x00`, variant `0x01`, dword `0x04`, bytes `0x08..0x0c`, counts at `0x10/0x14/0x18`, and raw table offsets at `0x1c..0x68`.
+- The named resource table is now directly parsed from raw DATs: header `+0x4c` is the table offset, entry size is `0x28`, and the first dword of each entry is a string offset.
+- Validation: raw `intro.dat` parses with 12 resources including `INTROBCK`, `LEVELS`, and `FONT`; raw `lv01s1.dat` parses with 58 resources including `PLAYER`, `PIPE_DRIP`, `SLIMER`, `STEEL_DRIP0`, `STEEL_DRIP1`, and `TEXTURE`.
+- Next likely expansion points for the parser are the `0x1c` reference table, the `0x40`/`0x30` record table, the `0x58` layer block, and the per-resource payload behind entry field `+0x04`.
+- `DogKnife` now also parses the `0x1c` cell-reference table and the `0x58` layer block from raw DATs.
+- Code-grounded semantics: layer cells are 4-byte values whose low 16 bits index a `7`-byte table at header `+0x1c`; byte `+5` of each reference record selects the named resource entry in the `0x28` resource table at header `+0x4c`.
+- For raw `lv01s1.dat`, the `0x1c` table spans `0x94..0x528`, yielding `167` full `7`-byte entries plus `3` trailing bytes; layer 0's max used cell-reference index is `166`, which fits exactly.
+- The `0x58` layer block is `3` consecutive records, each `0x10` bytes of descriptor followed immediately by `width * height * 4` bytes of cell data; descriptor dwords `+0x08` and `+0x0c` are width and height.
+- For raw `lv01s1.dat`, all three layers parse as `120 x 320`; non-zero cell counts are `106`, `39`, and `21` respectively.
+- `DogKnife` now also parses shared payload groups behind resource-entry field `+0x04`.
+- Non-zero `+0x04` pointers partition cleanly into `0x30`-byte blocks and many named resources alias the same payload start.
+- Validated `lv01s1.dat` payload-group sizes: `PLAYER=29`, `PAW=14`, `PIPE_DRIP=14`, `TEXTURE=3`, `SLIMER=62`, `BLOBS=168` blocks.
+- Validated `intro.dat` payload-group sizes: `INTROBCK=2`, `TITLE=1`, `DISPLAY=64`, `FONT=18` blocks.
+- `FUN_00035000` reading `INTROBCK` payload offsets `+0x24` and `+0x54` now lines up with block 0 and block 1 of the parsed two-block `INTROBCK` payload group.
+- `DogKnife` now also parses shared sequence groups behind resource-entry field `+0x08` as active bytes up to the last `0xFF` terminator, plus trailing spill bytes when present.
+- Validated `lv01s1.dat` `+0x08` groups are short and shared across resource aliases; examples: powerups `00 01 02 03 04 04 03 02 01 00 FF`, `PAW` `00..0D FF`, `TEXTURE` `00 00 01 01 02 02 01 01 FF`.
+- Validated `intro.dat` also fits the same `+0x08` parser surface; `PLINGY` has 2 trailing bytes (`48 5A`) after the last `0xFF`, so sequence parsing now trims at the last terminator instead of treating the full bounded span as active data.
+- Grounded correlation: active `+0x08` bytes stay within the block count of the corresponding `+0x04` payload group, which strongly supports treating `+0x08` as frame/block selection order over the shared `0x30`-byte block arrays.
+- `DogKnife` now has a first probe export command: `--export-textures <raw-dat>`.
+- On raw `lv01s1.dat`, `TEXTURE` is now exported to PNGs using grounded block fields: width=`+0x08`, height=`+0x0C`, pixel-data offset=`+0x24`.
+- `TEXTURE` block data offsets `0xC441C`, `0xC641C`, `0xC841C` advance by `0x2000`, exactly matching `64 * 128` bytes per block.
+- The `TEXTURE` sequence `00 00 01 01 02 02 01 01` now drives exported frame order; exporter writes 3 block PNGs and 8 sequence-frame PNGs in both grayscale and a `palette_bank_03` probe set.
+- Current palette probe: `lv01s1.dat` palette region `0x116CDC..0x118ADC` is `10 * 0x300` bytes; exporter treats it as 10 VGA-style palette banks and uses `((block.Value20 >> 16) & 0xFF) == 3` as the best current `TEXTURE` palette-bank candidate.
+- `DogKnife` now also has a generic probe export command: `--export-resource-planes <raw-dat> --resource <name>`.
+- First generic-family export beyond `TEXTURE`: `PAW` from raw `lv01s1.dat` exported successfully to `TestOutput/DatExports/lv01s1/PAW` with 14 block PNGs and 14 sequence-frame PNGs in grayscale and `palette_bank_02` probe output.
+- `PAW` payload group `0x1084DC..0x10877C` has 14 blocks, all `23x19`, with frame order `00 01 02 ... 0D` from its parsed `+0x08` sequence table.
+- Current code-grounded limit is unchanged: palette banks are definitely used as `bank * 0x300 + DAT_0006557c`, but the exact block/object field supplying that bank for these exports is still not proven in Ghidra.
