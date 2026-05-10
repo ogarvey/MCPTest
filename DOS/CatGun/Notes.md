@@ -649,3 +649,47 @@
 	- block `16` probe mask crops to `34x18`, matching the declared `Value08/Value0C = 0x22/0x12`
 	- later blocks shrink inward (`32x16`, `30x14`, `26x12`, `24x10`, `22x8`), which is consistent with the remap stream only touching subregions of the runtime destination surface
 - This keeps the type-`3` work grounded: the shared family is now inspectable and partially reconstructible in DogKnife, but final sprite output still needs the true pre-remap destination content rather than a guessed synthetic base surface.
+
+## 2026-05-10 - Type-3 PLAYER remap overlaps earlier direct PLAYER output
+
+- `FUN_00038130()` call-site disassembly sharpens the type-`3` `PLAYER` picture beyond the earlier generic queue summary:
+	- signed Y-offset table at `0x380E0` = `[0, -1, -2, -4, -5, -6, -6, -5, -4, -2, -1, 0]`
+	- type-`3` selector table at `0x380F8` = `[0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0]`
+	- the shared-remap call is `FUN_00013430(DAT_000884BC, objX + 5, selector + 0x10, 0)` with hidden `EBX = objY + 0x11`
+	- for the selected type-`3` blocks `16..21`, `FUN_00013430()` therefore stages destination top row `objY + 0x11` and queue bucket `objY + 0x11 + block.Value0C`
+- The same state stages direct type-`1` `PLAYER` work using the normal `FUN_00012D40()` bucket convention `top + height`.
+- Raw `PLAYER` blocks `0..15` are all direct type-`1` blocks with declared size `44 x 32`, while the shared type-`3` subset `16..21` is `34 x 18`.
+- Because the direct `PLAYER` top row in this state is `objY + table[phase]` and the type-`3` remap top row is `objY + 0x11`, the direct `44 x 32` base draw spans well into the remap area for every phase in the recovered table.
+- The nearby `PILOT` draw in the same state lands at `objY + table[phase] - 7`, which is too high to be the main remap substrate.
+- This does not fully prove queue execution order for every state, but it strongly supports the working model that the type-`3` `PLAYER` family remaps already-drawn direct `PLAYER` pixels rather than representing a standalone sprite plane or the `PILOT` base.
+
+## 2026-05-10 - Type-1 payload families behind 0x4D100 / 0x4D31C / 0x4D4DC
+
+- The loader-patched type-`1` targets are not generic game logic entry points; they are reusable inline blit kernels selected by payload signature.
+- `0x4D0F4` / `0x4D100` family:
+	- raw top-level signature bytes: `8B F8 83 E0 03 FF 14 85 00 D1 04 00`
+	- `FUN_000514D0()` patches payload dword `+0x08` to `0x4D100`
+	- the kernels at `0x4D130` and neighbors dispatch on `dest & 3` and perform fixed `16 x 16` copies with destination stride `0x180`
+	- inline source bytes begin immediately after the stub at payload `+0x0C`
+- `0x4D30C` / `0x4D31C` family:
+	- raw top-level signature bytes: `50 83 E0 03 5F FF 14 85 1C D3 04 00`
+	- `FUN_000514D0()` patches payload dword `+0x08` to `0x4D31C`
+	- the kernels at `0x4D350` and neighbors also dispatch on `dest & 3`, then parse a variable-row dword stream beginning at payload `+0x10`
+	- payload dword `+0x0C` is a relative offset from payload `+0x10` to the next stage; the outer `0x4D31C` kernel jumps to the current `ESI` when the row stream finishes
+	- recovered row format from the kernel:
+	  - `u32 rowCount`
+	  - per row: `u32 destSkip`, `u32 encodedDwordCount`, then `(encodedDwordCount + 1)` dwords of inline source data
+- `0x4D4D4` / `0x4D4DC` helper family:
+	- raw helper signature bytes: `50 55 90 E8 00 00 00 00`
+	- `FUN_000514D0()` patches the helper call at payload `+0x04` to target `0x4D4DC`
+	- `0x4D4DC` consumes helper data starting at payload `+0x08`
+	- its code shows a dword-write phase followed by a word-write phase, so this is a scatter-write helper rather than a simple linear copy kernel
+- DogKnife now has `--inspect-type1-probes <raw-dat> --resource <name>` to classify type-`1` blocks conservatively and parse the outer `0x4D31C` stream without attempting emulation.
+- Validation on raw `lv01s1.dat`:
+	- `PILOT`: `45 / 45` type-`1` blocks are recognized as the `0x4D31C` variable-row copy family
+	- `PLAYER` type-`1` subset: `16` variable-row copy blocks, `3` direct `0x4D4DC` helper blocks, `4` remaining unknown signatures
+	- `PSTARS`: `11` direct `0x4D4DC` helper blocks and `11` remaining unknown signatures
+- So the direct type-`1` family is now at least split into three concrete groups:
+	- `0x4D31C` variable-row copy payloads
+	- direct `0x4D4DC` scatter-helper payloads
+	- a still-unresolved `BB ...` signature family used by `PSTARS` and part of later `PLAYER`

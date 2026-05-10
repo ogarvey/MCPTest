@@ -39,6 +39,23 @@ internal static class Program
 				return 0;
 			}
 
+			if (!string.IsNullOrWhiteSpace(options.Type1ProbeExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.Type1ProbeExportPath, ".dat");
+				if (string.IsNullOrWhiteSpace(options.ResourceName))
+				{
+					throw new ArgumentException("--inspect-type1-probes requires --resource <name>.");
+				}
+
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				Type1PayloadProbeExportResult result = Type1PayloadProbeExporter.Export(dat, options.ResourceName, exportOutputPath);
+				Console.WriteLine($"Exported {result.ResourceName} type-1 probe metadata to: {result.OutputDirectory}");
+				Console.WriteLine($"Blocks: {result.BlockCount}");
+				Console.WriteLine($"Known families: {result.KnownFamilyCount}");
+				return 0;
+			}
+
 			if (!string.IsNullOrWhiteSpace(options.Type3ProbeExportPath))
 			{
 				string datPath = ResolveExistingFilePath(options.Type3ProbeExportPath, ".dat");
@@ -214,6 +231,7 @@ internal static class Program
 		Console.WriteLine("  dotnet run -- --list [--input <path>]");
 		Console.WriteLine("  dotnet run -- --dump-dat <path-to-raw-dat>");
 		Console.WriteLine("  dotnet run -- --export-textures <path-to-raw-dat> [--output <dir>]");
+		Console.WriteLine("  dotnet run -- --inspect-type1-probes <path-to-raw-dat> --resource <name> [--output <dir>] (classifies loader-patched type-1 payload families and parses outer streams)");
 		Console.WriteLine("  dotnet run -- --export-type3-probes <path-to-raw-dat> --resource <name> [--output <dir>] (exports coverage masks and lookup pages for the shared type-3 remap family)");
 		Console.WriteLine("  dotnet run -- --export-resource-planes <path-to-raw-dat> --resource <name> [--output <dir>] (currently disabled pending code-proven family decoders)");
 	}
@@ -313,7 +331,7 @@ internal static class Program
 		return string.Join(" ", bytes.Select(value => value.ToString("X2")));
 	}
 
-	private sealed record AppOptions(string? InputPath, string? OutputPath, string? DatPath, string? TextureExportPath, string? Type3ProbeExportPath, string? RawPlaneExportPath, string? ResourceName, bool ListOnly, bool ShowHelp)
+	private sealed record AppOptions(string? InputPath, string? OutputPath, string? DatPath, string? TextureExportPath, string? Type1ProbeExportPath, string? Type3ProbeExportPath, string? RawPlaneExportPath, string? ResourceName, bool ListOnly, bool ShowHelp)
 	{
 		public static AppOptions Parse(string[] args)
 		{
@@ -321,6 +339,7 @@ internal static class Program
 			string? outputPath = null;
 			string? datPath = null;
 			string? textureExportPath = null;
+			string? type1ProbeExportPath = null;
 			string? type3ProbeExportPath = null;
 			string? rawPlaneExportPath = null;
 			string? resourceName = null;
@@ -349,6 +368,10 @@ internal static class Program
 
 					case "--export-textures":
 						textureExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--inspect-type1-probes":
+						type1ProbeExportPath = ReadValue(args, ref index, argument);
 						break;
 
 					case "--export-type3-probes":
@@ -407,6 +430,11 @@ internal static class Program
 				activeDatActions++;
 			}
 
+			if (!string.IsNullOrWhiteSpace(type1ProbeExportPath))
+			{
+				activeDatActions++;
+			}
+
 			if (!string.IsNullOrWhiteSpace(type3ProbeExportPath))
 			{
 				activeDatActions++;
@@ -419,15 +447,15 @@ internal static class Program
 
 			if (1 < activeDatActions)
 			{
-				throw new ArgumentException("Use only one of --dump-dat, --export-textures, --export-type3-probes, or --export-resource-planes at a time.");
+				throw new ArgumentException("Use only one of --dump-dat, --export-textures, --inspect-type1-probes, --export-type3-probes, or --export-resource-planes at a time.");
 			}
 
-			if (string.IsNullOrWhiteSpace(rawPlaneExportPath) && string.IsNullOrWhiteSpace(type3ProbeExportPath) && !string.IsNullOrWhiteSpace(resourceName))
+			if (string.IsNullOrWhiteSpace(rawPlaneExportPath) && string.IsNullOrWhiteSpace(type1ProbeExportPath) && string.IsNullOrWhiteSpace(type3ProbeExportPath) && !string.IsNullOrWhiteSpace(resourceName))
 			{
-				throw new ArgumentException("--resource is only valid with --export-resource-planes or --export-type3-probes.");
+				throw new ArgumentException("--resource is only valid with --inspect-type1-probes, --export-resource-planes, or --export-type3-probes.");
 			}
 
-			return new AppOptions(inputPath, outputPath, datPath, textureExportPath, type3ProbeExportPath, rawPlaneExportPath, resourceName, listOnly, showHelp);
+			return new AppOptions(inputPath, outputPath, datPath, textureExportPath, type1ProbeExportPath, type3ProbeExportPath, rawPlaneExportPath, resourceName, listOnly, showHelp);
 		}
 
 		private static string ReadValue(string[] args, ref int index, string optionName)
