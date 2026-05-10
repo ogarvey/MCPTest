@@ -14,4 +14,9 @@ internal sealed record DatPayloadBlock30(
 	int Value20,
 	int Value24,
 	int Value28,
-	int Value2C);
+	int Value2C)
+{
+	public int LoaderType => Value20 & 0xFF;
+
+	public int PaletteBankCandidate => (Value20 >> 16) & 0xFF;
+}

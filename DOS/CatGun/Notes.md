@@ -478,3 +478,174 @@
 	  - `TEXTURE`
 	  - `PAW`
 	- The next valuable code-driven step is still to prove the palette-bank source in Ghidra, so the palette choice stops being heuristic.
+
+## 2026-05-10 - `PAW` export correction from runtime code
+
+- The prior `PAW` raw-plane probe should now be treated as invalid.
+
+- Ghidra-backed runtime path:
+	- `FUN_0003D030()` resolves the named `PAW` resource and binds callback `LAB_0003B6D0`.
+	- `LAB_0003B6D0` funnels through `FUN_00013040()` when the effect reaches its frame-staging path.
+	- `FUN_00013040()` does not read `block + 0x24` as a `width * height` byte plane. It stages the current frame's `+0x24` pointer into a work item and stores the destination separately.
+	- The queue processors `FUN_00012EA0()` / `FUN_00012FE0()` later consume those staged work items; for the type used by `PAW`, the staged `+0x24` pointer is treated as executable/code-driven blit payload rather than as raw indexed image bytes.
+
+- Concrete disassembly-grounded reason the exporter was wrong:
+	- `FUN_00013040()` stores the current frame payload pointer from `(*(obj->resource + 4) + frame * 0x30 + 0x24)` into the queued work item.
+	- The worker path later dispatches through that staged field as code/input, which means `PAW` block payloads are on a decode/blit path that is fundamentally different from the raw `TEXTURE` probe path.
+	- This also matches the observed first `PAW` payload bytes at `0x18034`: `50 83 E0 03 5F FF 14 85 ...`, which look like executable x86-style code, not a validated 8-bit pixel plane.
+
+- Updated status:
+	- `TEXTURE` remains only a visually successful probe pending full code-proof of its draw path and palette-bank source.
+	- `PAW` must no longer be treated as a working raw-plane export family.
+	- `DogKnife`'s generic `--export-resource-planes` path should be considered disabled until a family-specific decoder is proven from Ghidra.
+
+## 2026-05-10 - Shared sprite/decode queue recovery
+
+- The per-frame graphics work queue is now partially recovered from the allocator/worker path around `FUN_00012D40()`, `FUN_00012EA0()`, and `FUN_00012FE0()`.
+
+- Queue record shape recovered from staging/worker code:
+	- record size: `0x18` bytes
+	- `+0x00`: owner/context pointer
+	- `+0x04`: payload pointer or payload descriptor pointer
+	- `+0x08`: destination surface pointer
+	- `+0x0C`: auxiliary decoder field (used by some record types)
+	- `+0x14`: linked-list/next index in the general queue
+	- `+0x16`: record type
+
+- Type `1` record path:
+	- staged by `FUN_00013040()`
+	- `record[+0x04] = current_block->+0x24`
+	- `record[+0x08] = destination pointer in the `0x180`-pitch surface`
+	- consumed by `FUN_00012EA0()` / `FUN_00012FE0()` as:
+	  - `EAX = record[+0x08]`
+	  - `CALL record[+0x04]`
+	- This proves the `+0x24` payload for this family is executable blit code, not a raw byte plane.
+	- `FUN_0003BDC0()` is now confirmed as a generic wrapper for this path: it runs the shared update/visibility checks (`FUN_0003FBF0()`, `FUN_00040360()`) and then falls through to `FUN_00013040()`.
+	- `FUN_0003BDC0()` has many parameter/xref users across the program, so this executable-payload path is shared beyond `PAW` rather than being a one-off special case.
+	- Raw `lv01s1.dat` examples such as `PAW`, `NITRO_POWERUP`, and `1UP` block-0 payloads all begin `50 83 E0 03 5F FF 14 85 ...`, which matches this executable-payload interpretation.
+
+- Type `3` record path is the first shared non-code decoder:
+	- staged by `FUN_00013100()` and `FUN_00013430()`
+	- `record[+0x04] = current_block->+0x24`
+	- `record[+0x08] = destination pointer`
+	- `record[+0x0C] = current_block->+0x28`
+	- consumed by `FUN_00012EA0()` / `FUN_00012FE0()` via `FUN_00028A00()` with:
+	  - `ESI = record[+0x04]`
+	  - `EDI = record[+0x08]`
+	  - `EBX = record[+0x0C]`
+
+- `FUN_00028A00()` decoder behavior recovered from disassembly:
+	- `ESI` source begins with `u16 segmentCount`.
+	- Then for each segment:
+	  - read `u16 destSkip`
+	  - add `destSkip` to `EDI`
+	  - read `u16 spanLength`
+	  - rewrite `spanLength` bytes already present at `EDI` through a 256-byte lookup page derived from `EBX`
+	- The lookup page is addressed by replacing the low byte of the `EBX` page pointer with the existing destination pixel value, so the effective table page is `EBX & 0xFFFFFF00`.
+	- This is a sparse remap/mask blitter over existing framebuffer content, not a standalone raw sprite unpacker.
+	- Direct callers outside the queue path also exist (`0x2EAE0`, `0x2EE35`, `0x2F68A`, `0x36123`, `0x42CAA`), which supports this being a shared graphics routine rather than a one-off effect helper.
+	- Named-resource tie-in now confirmed: `FUN_0002CA90()` assigns `DAT_000884BC = "PLAYER"`, and `FUN_00038130()` calls `FUN_00013430(DAT_000884BC, ...)`, so the shared type-3 path is definitely used on the `PLAYER` resource.
+	- The same `FUN_00038130()` path also stages direct type-1 payload calls from `DAT_000884B4`, which `FUN_0002CA90()` assigns to `"PILOT"`. So the player/pilot rendering path mixes both shared and direct graphics payload families.
+
+- Type `6` record path is a second shared decoder family:
+	- queued records of this type are consumed by `FUN_00012EA0()` through `FUN_00028C64()`.
+	- Entry-state recovered from `FUN_00012EA0()`:
+	  - `EAX = *(struct + 0x08)`
+	  - `EBX = *(struct + 0x0C)`
+	  - `ESI = *(struct + 0x24)`
+	  - `EDI = record[+0x08]`
+	- `FUN_00028C64()` walks a byte stream at `ESI`, splits each byte into high/low nibbles, and dispatches through a `16`-entry handler table at `0x00028CAB`.
+	- The handlers write fixed patterns into the current destination row and the row at `+0x180`, while the outer loop advances by `+0x300` per step.
+	- This is therefore a compact nibble-opcode pattern/stencil blitter, not a raw plane reader.
+
+- Current implication for extractor work:
+	- There is no single validated “sprite decoder” yet.
+	- At minimum, we now have three distinct graphics payload families:
+	  - direct executable blit payloads at block `+0x24`
+	  - shared span-remap decoder `FUN_00028A00()` with auxiliary page at block `+0x28`
+	  - shared nibble-opcode decoder `FUN_00028C64()` on a separate structured input path
+	- The next grounded step is to tie specific named resources to these families so DogKnife can add per-family decoders instead of heuristic exporters.
+
+## 2026-05-10 - Loader fixups for the global `0x30` block table
+
+- `FUN_0002A630()` is now confirmed to patch the same global `0x30`-byte block space that `DogKnife` is parsing behind resource entry `+0x04`.
+	- Raw `lv01s1.dat` header `+0x40` (`Table40Offset`) = `0x107BAC`.
+	- Header `+0x10` (`Table40EntryCount`) = `1131`.
+	- `0x107BAC + 1131 * 0x30 = 0x114FBC`, which is exactly the end of the last parsed payload-block region and immediately precedes the resource table at `0x11510C`.
+	- So the loader's `DAT_000883C8` loop is not some unrelated side table; it is the canonical global block array behind all the resource `+0x04` pointers.
+
+- `FUN_0002ACD0(ptr, base)` is the generic pointer rebaser used by the loader.
+	- Behavior is simple and exact: if `*ptr != 0`, replace it with `*ptr + base`.
+	- `FUN_0002A630()` uses it on resource entry fields `+0x04`, `+0x08`, `+0x0C`, `+0x14`, and `+0x18`.
+	- It also uses it inside the `0x30`-block loop on block-local fields `+0x24` and/or `+0x28` depending on the block type byte at `+0x20`.
+
+- Block type semantics recovered from `FUN_0002A630()`'s `DAT_000883C8` loop:
+	- type `1`: rebase block `+0x24`, then call `FUN_000514D0()` on that rebased payload pointer
+	- type `3` and type `5`: rebase both block `+0x24` and block `+0x28`
+	- type `4` and type `8`: rebase block `+0x24` only
+	- type `2` and type `9`: no local `+0x24/+0x28` fixup in this loop
+	- This matches the runtime decoder families already recovered later in the frame queue: direct executable payloads rely on patched `+0x24`, while shared remap-family blocks need both `+0x24` and `+0x28` rebased.
+
+- `FUN_000514D0()` is the direct-payload patch helper for type-`1` executable blit blobs.
+	- If the first dword is `0x03E08350` (raw bytes `50 83 E0 03`), it writes `0x0004D31C` to payload dword `+0x08`, then follows a nested pointer at `payload + 0x10 + payload[3]`.
+	- If that nested location begins with dword `0xE8905550` (raw bytes `50 55 90 E8`), it patches nested dword `+0x04` to the relative target `0x0004D4DC - nested_ptr - 8`.
+	- If the first dword is `0xE083F88B` (raw bytes `8B F8 83 E0`), it writes `0x0004D100` to payload dword `+0x08`.
+	- So the raw executable payload blobs are not directly runnable as-extracted: the loader both rebases them and patches embedded dispatcher/relative-call fields before the queue worker later calls them.
+
+- Raw block checks now line up exactly with that patch logic:
+	- `PLAYER` blocks `0..7` and `PILOT` blocks `0..5` all begin `50 83 E0 03 5F FF 14 85 1C 19 19 00 ...`, which is the `FUN_000514D0()` signature `0x03E08350`.
+	- For raw `lv01s1.dat`, the loader type byte is the low byte of block dword `+0x20`.
+	- `PLAYER` splits cleanly by that byte:
+	  - blocks `0..15` and `22..28` are type `1`
+	  - blocks `16..21` are type `3`, with shared `+0x28 = 0x00107900`
+	- `PILOT` is `45/45` blocks of type `1` in raw `lv01s1.dat`.
+	- `PSTARS` is `22/22` blocks of type `1` in raw `lv01s1.dat`.
+	- Example raw `PLAYER` headers:
+	  - block `1`: `+0x24=0x000104E4`, `+0x28=0x000BB8A0`
+	  - block `2`: `+0x24=0x000109E0`, `+0x28=0x00000018`
+	  - block `7`: `+0x24=0x00012278`, `+0x28=0x000BB71C`
+	- The explicit type split now explains why the `PLAYER` family appears on both the shared type-`3` path and the direct type-`1` path depending on block/state selection.
+	- `PSTARS` does not share the same top-level stub on every block:
+	  - blocks `0/1` begin with immediate pattern-writer style code/data (`BB C8 CC CF CC ...`)
+	  - blocks `2/3` begin `50 55 90 E8 ...`, which matches the nested signature that `FUN_000514D0()` patches when reached through the direct executable family.
+	- `PSTARS` is therefore in the executable-payload bucket, but it is not just a trivial clone of the `PLAYER`/`PILOT` top-level stub.
+
+## 2026-05-10 - Additional named state-handler mappings
+
+- `FUN_00038E90()` is a second concrete `PLAYER` state handler beyond `FUN_00038130()`.
+	- It calls `FUN_00013430(DAT_000884BC, ...)`, so it definitely uses the shared type-`3` `PLAYER` remap path.
+	- It also stages a direct type-`1` `PILOT` payload from `DAT_000884B4`.
+	- It stages additional direct type-`1` `PLAYER` payloads from `DAT_000884BC`.
+	- It periodically spawns `PSTARS` via `FUN_000347E0()`.
+	- So this state is a mixed composition of shared `PLAYER`, direct `PILOT`, direct `PLAYER`, and spawned `PSTARS` work.
+
+- `FUN_00039880()` is a pure direct-`PLAYER` render state.
+	- It does not call `FUN_00013430()`.
+	- It allocates queue work, then stages direct type-`1` payloads only from `DAT_000884BC`.
+	- This proves `PLAYER` is not exclusively a shared-remap family; some `PLAYER` frames are straight executable payloads.
+
+- `FUN_00039C20()` adds the first concrete runtime tie for `CHARGE`.
+	- If `*(state + 0x344) != 0`, it calls `FUN_0002D130()` before the usual queue staging.
+	- `FUN_0002D130()` pulls frames from `DAT_000884A8` and stages them directly as type-`1` payloads, so `CHARGE` is on the executable-payload family.
+	- The same `FUN_00039C20()` path then stages `PILOT` from `DAT_000884B4` and multiple direct `PLAYER` payloads from `DAT_000884BC`.
+	- This gives one verified mixed state that uses `CHARGE`, `PILOT`, and `PLAYER` together on the direct payload path.
+
+## 2026-05-10 - DogKnife loader-aware Table40 and type-3 probe export
+
+- DogKnife now materializes the global `Table40` block table directly from DAT header `+0x40` / `+0x10`, so the code has a first-class view of the same `0x30`-byte block space that `FUN_0002A630()` rebases and patches at load time.
+- `DatPayloadBlock30` now exposes the loader type from the low byte of block dword `+0x20`, and `--dump-dat` now reports loader-type distributions for each payload group instead of only dumping the first block raw.
+- DogKnife now has a conservative shared-remap probe command:
+	- `--export-type3-probes <raw-dat> --resource <name>`
+	- It does not pretend to export final sprite pixels.
+	- Instead it exports code-backed diagnostics for loader type-`3` blocks:
+	  - remap coverage masks reconstructed from the `FUN_00028A00()` `u16 segmentCount` / `u16 destSkip` / `u16 spanLength` stream
+	  - raw and grayscale lookup-page dumps from block `+0x28`
+	  - metadata with segment counts, touched-pixel totals, runtime-stride bounding boxes, and skipped non-type-`3` blocks
+- Validation on raw `lv01s1.dat` with `--resource PLAYER`:
+	- payload group `0x107BAC..0x10811C`
+	- loader types `0x01:23, 0x03:6`
+	- exported type-`3` blocks `16..21`
+	- all six share lookup page `0x107900`
+	- block `16` probe mask crops to `34x18`, matching the declared `Value08/Value0C = 0x22/0x12`
+	- later blocks shrink inward (`32x16`, `30x14`, `26x12`, `24x10`, `22x8`), which is consistent with the remap stream only touching subregions of the runtime destination surface
+- This keeps the type-`3` work grounded: the shared family is now inspectable and partially reconstructible in DogKnife, but final sprite output still needs the true pre-remap destination content rather than a guessed synthetic base surface.

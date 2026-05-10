@@ -14,25 +14,31 @@ internal sealed class CatGunDat
 
 	private CatGunDat(
 		string filePath,
+		byte[] rawBytes,
 		CatGunDatHeader header,
 		IReadOnlyList<DatCellReferenceEntry> cellReferences,
 		int cellReferencePaddingByteCount,
 		IReadOnlyList<DatLayer> layers,
 		IReadOnlyList<DatSequenceGroup> sequenceGroups,
 		IReadOnlyList<DatPayloadGroup> payloadGroups,
+		IReadOnlyList<DatPayloadBlock30> table40Blocks,
 		IReadOnlyList<DatResourceEntry> resources)
 	{
 		FilePath = filePath;
+		RawBytes = rawBytes;
 		Header = header;
 		CellReferences = cellReferences;
 		CellReferencePaddingByteCount = cellReferencePaddingByteCount;
 		Layers = layers;
 		SequenceGroups = sequenceGroups;
 		PayloadGroups = payloadGroups;
+		Table40Blocks = table40Blocks;
 		Resources = resources;
 	}
 
 	public string FilePath { get; }
+
+	public ReadOnlyMemory<byte> RawBytes { get; }
 
 	public CatGunDatHeader Header { get; }
 
@@ -45,6 +51,8 @@ internal sealed class CatGunDat
 	public IReadOnlyList<DatSequenceGroup> SequenceGroups { get; }
 
 	public IReadOnlyList<DatPayloadGroup> PayloadGroups { get; }
+
+	public IReadOnlyList<DatPayloadBlock30> Table40Blocks { get; }
 
 	public IReadOnlyList<DatResourceEntry> Resources { get; }
 
@@ -91,6 +99,7 @@ internal sealed class CatGunDat
 			Offset68: ReadInt32(bytes, 0x68));
 
 		ValidateResourceTableBounds(bytes.Length, header.ResourceTableOffset, header.ResourceEntryCount);
+		ValidateBlockTableBounds(bytes.Length, header.Table40Offset, header.Table40EntryCount, "DAT Table40 block table");
 		IReadOnlyList<DatResourceEntry> resources = ParseResources(bytes, header.ResourceTableOffset, header.ResourceEntryCount);
 		(int nextBlockOffset, int cellReferencePaddingByteCount) = FindCellReferenceTableBounds(header, bytes.Length);
 		IReadOnlyList<DatCellReferenceEntry> cellReferences = ParseCellReferences(
@@ -101,15 +110,18 @@ internal sealed class CatGunDat
 		IReadOnlyList<DatLayer> layers = ParseLayers(bytes, header.LayerTableOffset);
 		IReadOnlyList<DatSequenceGroup> sequenceGroups = ParseSequenceGroups(bytes, header, resources);
 		IReadOnlyList<DatPayloadGroup> payloadGroups = ParsePayloadGroups(bytes, header, resources);
+		IReadOnlyList<DatPayloadBlock30> table40Blocks = ParseBlockTable(bytes, header.Table40Offset, header.Table40EntryCount);
 
 		return new CatGunDat(
 			Path.GetFullPath(filePath),
+			bytes,
 			header,
 			cellReferences,
 			cellReferencePaddingByteCount,
 			layers,
 			sequenceGroups,
 			payloadGroups,
+			table40Blocks,
 			resources);
 	}
 
@@ -231,21 +243,7 @@ internal sealed class CatGunDat
 			for (int blockIndex = 0; blockIndex < byteCount / 0x30; blockIndex++)
 			{
 				int blockOffset = payloadOffset + (blockIndex * 0x30);
-				blocks.Add(new DatPayloadBlock30(
-					Index: blockIndex,
-					Offset: blockOffset,
-					Value00: ReadInt32(bytes, blockOffset + 0x00),
-					Value04: ReadInt32(bytes, blockOffset + 0x04),
-					Value08: ReadInt32(bytes, blockOffset + 0x08),
-					Value0C: ReadInt32(bytes, blockOffset + 0x0C),
-					Value10: ReadInt32(bytes, blockOffset + 0x10),
-					Value14: ReadInt32(bytes, blockOffset + 0x14),
-					Value18: ReadInt32(bytes, blockOffset + 0x18),
-					Value1C: ReadInt32(bytes, blockOffset + 0x1C),
-					Value20: ReadInt32(bytes, blockOffset + 0x20),
-					Value24: ReadInt32(bytes, blockOffset + 0x24),
-					Value28: ReadInt32(bytes, blockOffset + 0x28),
-					Value2C: ReadInt32(bytes, blockOffset + 0x2C)));
+				blocks.Add(ParseBlock(bytes, blockOffset, blockIndex));
 			}
 
 			List<string> resourceNames = resources
@@ -264,6 +262,38 @@ internal sealed class CatGunDat
 		}
 
 		return payloadGroups;
+	}
+
+	private static IReadOnlyList<DatPayloadBlock30> ParseBlockTable(byte[] bytes, int tableOffset, int entryCount)
+	{
+		List<DatPayloadBlock30> blocks = new(entryCount);
+
+		for (int blockIndex = 0; blockIndex < entryCount; blockIndex++)
+		{
+			int blockOffset = tableOffset + (blockIndex * 0x30);
+			blocks.Add(ParseBlock(bytes, blockOffset, blockIndex));
+		}
+
+		return blocks;
+	}
+
+	private static DatPayloadBlock30 ParseBlock(byte[] bytes, int blockOffset, int blockIndex)
+	{
+		return new DatPayloadBlock30(
+			Index: blockIndex,
+			Offset: blockOffset,
+			Value00: ReadInt32(bytes, blockOffset + 0x00),
+			Value04: ReadInt32(bytes, blockOffset + 0x04),
+			Value08: ReadInt32(bytes, blockOffset + 0x08),
+			Value0C: ReadInt32(bytes, blockOffset + 0x0C),
+			Value10: ReadInt32(bytes, blockOffset + 0x10),
+			Value14: ReadInt32(bytes, blockOffset + 0x14),
+			Value18: ReadInt32(bytes, blockOffset + 0x18),
+			Value1C: ReadInt32(bytes, blockOffset + 0x1C),
+			Value20: ReadInt32(bytes, blockOffset + 0x20),
+			Value24: ReadInt32(bytes, blockOffset + 0x24),
+			Value28: ReadInt32(bytes, blockOffset + 0x28),
+			Value2C: ReadInt32(bytes, blockOffset + 0x2C));
 	}
 
 	private static int[] GetGlobalBoundaryCandidates(CatGunDatHeader header, int fileLength)
@@ -503,6 +533,26 @@ internal sealed class CatGunDat
 		{
 			throw new InvalidDataException(
 				$"DAT resource table exceeds file bounds: offset=0x{resourceTableOffset:X}, count={resourceCount}, end=0x{endOffset:X}, fileSize=0x{fileLength:X}");
+		}
+	}
+
+	private static void ValidateBlockTableBounds(int fileLength, int tableOffset, int entryCount, string tableName)
+	{
+		if (entryCount < 0)
+		{
+			throw new InvalidDataException($"Invalid {tableName} entry count: {entryCount}");
+		}
+
+		if (tableOffset < 0)
+		{
+			throw new InvalidDataException($"Invalid {tableName} offset: 0x{tableOffset:X}");
+		}
+
+		long endOffset = tableOffset + ((long)entryCount * 0x30);
+		if (endOffset > fileLength)
+		{
+			throw new InvalidDataException(
+				$"{tableName} exceeds file bounds: offset=0x{tableOffset:X}, count={entryCount}, end=0x{endOffset:X}, fileSize=0x{fileLength:X}");
 		}
 	}
 

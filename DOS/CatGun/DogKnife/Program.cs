@@ -39,6 +39,23 @@ internal static class Program
 				return 0;
 			}
 
+			if (!string.IsNullOrWhiteSpace(options.Type3ProbeExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.Type3ProbeExportPath, ".dat");
+				if (string.IsNullOrWhiteSpace(options.ResourceName))
+				{
+					throw new ArgumentException("--export-type3-probes requires --resource <name>.");
+				}
+
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				Type3RemapProbeExportResult result = Type3RemapProbeExporter.Export(dat, options.ResourceName, exportOutputPath);
+				Console.WriteLine($"Exported {result.ResourceName} type-3 probe assets to: {result.OutputDirectory}");
+				Console.WriteLine($"Blocks: {result.BlockCount}");
+				Console.WriteLine($"Lookup pages: {result.UniqueLookupPageCount}");
+				return 0;
+			}
+
 			if (!string.IsNullOrWhiteSpace(options.RawPlaneExportPath))
 			{
 				string datPath = ResolveExistingFilePath(options.RawPlaneExportPath, ".dat");
@@ -197,7 +214,8 @@ internal static class Program
 		Console.WriteLine("  dotnet run -- --list [--input <path>]");
 		Console.WriteLine("  dotnet run -- --dump-dat <path-to-raw-dat>");
 		Console.WriteLine("  dotnet run -- --export-textures <path-to-raw-dat> [--output <dir>]");
-		Console.WriteLine("  dotnet run -- --export-resource-planes <path-to-raw-dat> --resource <name> [--output <dir>]");
+		Console.WriteLine("  dotnet run -- --export-type3-probes <path-to-raw-dat> --resource <name> [--output <dir>] (exports coverage masks and lookup pages for the shared type-3 remap family)");
+		Console.WriteLine("  dotnet run -- --export-resource-planes <path-to-raw-dat> --resource <name> [--output <dir>] (currently disabled pending code-proven family decoders)");
 	}
 
 	private static void PrintDatSummary(CatGunDat dat)
@@ -208,6 +226,7 @@ internal static class Program
 		Console.WriteLine($"Header dword @0x04: 0x{dat.Header.Value04:X8}");
 		Console.WriteLine($"Header bytes @0x08-0x0C: {dat.Header.Byte08}, {dat.Header.Byte09}, {dat.Header.Byte0A}, {dat.Header.Byte0B}, {dat.Header.Byte0C}");
 		Console.WriteLine($"Table40 entry count : {dat.Header.Table40EntryCount}");
+		Console.WriteLine($"Table40 table    @0x40: 0x{dat.Header.Table40Offset:X} ({dat.Table40Blocks.Count} blocks)");
 		Console.WriteLine($"Resource entry count: {dat.Header.ResourceEntryCount}");
 		Console.WriteLine($"Table64 entry count : {dat.Header.Table64EntryCount}");
 		Console.WriteLine($"Cell ref entries    : {dat.CellReferences.Count} (+{dat.CellReferencePaddingByteCount} trailing bytes)");
@@ -266,16 +285,27 @@ internal static class Program
 		foreach (DatPayloadGroup payloadGroup in dat.PayloadGroups)
 		{
 			string names = string.Join(", ", payloadGroup.ResourceNames);
+			string loaderTypes = FormatLoaderTypeDistribution(payloadGroup.Blocks);
 			Console.WriteLine(
-				$"@0x{payloadGroup.StartOffset:X}..0x{payloadGroup.EndOffset:X} bytes=0x{payloadGroup.ByteCount:X} blocks={payloadGroup.Blocks.Count} trailing={payloadGroup.TrailingByteCount} resources={names}");
+				$"@0x{payloadGroup.StartOffset:X}..0x{payloadGroup.EndOffset:X} bytes=0x{payloadGroup.ByteCount:X} blocks={payloadGroup.Blocks.Count} trailing={payloadGroup.TrailingByteCount} types={loaderTypes} resources={names}");
 
 			if (payloadGroup.Blocks.Count > 0)
 			{
 				DatPayloadBlock30 firstBlock = payloadGroup.Blocks[0];
 				Console.WriteLine(
-					$"  block0: 00={firstBlock.Value00:X8} 04={firstBlock.Value04:X8} 08={firstBlock.Value08:X8} 0C={firstBlock.Value0C:X8} 10={firstBlock.Value10:X8} 14={firstBlock.Value14:X8} 18={firstBlock.Value18:X8} 1C={firstBlock.Value1C:X8} 20={firstBlock.Value20:X8} 24={firstBlock.Value24:X8} 28={firstBlock.Value28:X8} 2C={firstBlock.Value2C:X8}");
+					$"  block0: type=0x{firstBlock.LoaderType:X2} 00={firstBlock.Value00:X8} 04={firstBlock.Value04:X8} 08={firstBlock.Value08:X8} 0C={firstBlock.Value0C:X8} 10={firstBlock.Value10:X8} 14={firstBlock.Value14:X8} 18={firstBlock.Value18:X8} 1C={firstBlock.Value1C:X8} 20={firstBlock.Value20:X8} 24={firstBlock.Value24:X8} 28={firstBlock.Value28:X8} 2C={firstBlock.Value2C:X8}");
 			}
 		}
+	}
+
+	private static string FormatLoaderTypeDistribution(IEnumerable<DatPayloadBlock30> blocks)
+	{
+		return string.Join(
+			", ",
+			blocks
+				.GroupBy(block => block.LoaderType)
+				.OrderBy(group => group.Key)
+				.Select(group => $"0x{group.Key:X2}:{group.Count()}"));
 	}
 
 	private static string FormatByteSequence(IEnumerable<byte> bytes)
@@ -283,7 +313,7 @@ internal static class Program
 		return string.Join(" ", bytes.Select(value => value.ToString("X2")));
 	}
 
-	private sealed record AppOptions(string? InputPath, string? OutputPath, string? DatPath, string? TextureExportPath, string? RawPlaneExportPath, string? ResourceName, bool ListOnly, bool ShowHelp)
+	private sealed record AppOptions(string? InputPath, string? OutputPath, string? DatPath, string? TextureExportPath, string? Type3ProbeExportPath, string? RawPlaneExportPath, string? ResourceName, bool ListOnly, bool ShowHelp)
 	{
 		public static AppOptions Parse(string[] args)
 		{
@@ -291,6 +321,7 @@ internal static class Program
 			string? outputPath = null;
 			string? datPath = null;
 			string? textureExportPath = null;
+			string? type3ProbeExportPath = null;
 			string? rawPlaneExportPath = null;
 			string? resourceName = null;
 			bool listOnly = false;
@@ -318,6 +349,10 @@ internal static class Program
 
 					case "--export-textures":
 						textureExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--export-type3-probes":
+						type3ProbeExportPath = ReadValue(args, ref index, argument);
 						break;
 
 					case "--export-resource-planes":
@@ -372,6 +407,11 @@ internal static class Program
 				activeDatActions++;
 			}
 
+			if (!string.IsNullOrWhiteSpace(type3ProbeExportPath))
+			{
+				activeDatActions++;
+			}
+
 			if (!string.IsNullOrWhiteSpace(rawPlaneExportPath))
 			{
 				activeDatActions++;
@@ -379,15 +419,15 @@ internal static class Program
 
 			if (1 < activeDatActions)
 			{
-				throw new ArgumentException("Use only one of --dump-dat, --export-textures, or --export-resource-planes at a time.");
+				throw new ArgumentException("Use only one of --dump-dat, --export-textures, --export-type3-probes, or --export-resource-planes at a time.");
 			}
 
-			if (string.IsNullOrWhiteSpace(rawPlaneExportPath) && !string.IsNullOrWhiteSpace(resourceName))
+			if (string.IsNullOrWhiteSpace(rawPlaneExportPath) && string.IsNullOrWhiteSpace(type3ProbeExportPath) && !string.IsNullOrWhiteSpace(resourceName))
 			{
-				throw new ArgumentException("--resource is only valid with --export-resource-planes.");
+				throw new ArgumentException("--resource is only valid with --export-resource-planes or --export-type3-probes.");
 			}
 
-			return new AppOptions(inputPath, outputPath, datPath, textureExportPath, rawPlaneExportPath, resourceName, listOnly, showHelp);
+			return new AppOptions(inputPath, outputPath, datPath, textureExportPath, type3ProbeExportPath, rawPlaneExportPath, resourceName, listOnly, showHelp);
 		}
 
 		private static string ReadValue(string[] args, ref int index, string optionName)

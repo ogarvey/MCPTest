@@ -8,9 +8,22 @@ internal static class RawPlaneResourceExporter
 {
 	private const int PaletteColorCount = 256;
 	private const int PaletteBankSize = PaletteColorCount * 3;
+	private static readonly HashSet<string> SupportedResourceNames = new(StringComparer.Ordinal);
 
 	public static RawPlaneResourceExportResult Export(CatGunDat dat, string resourceName, string outputRoot)
 	{
+		if (string.Equals(resourceName, "TEXTURE", StringComparison.Ordinal))
+		{
+			throw new InvalidOperationException(
+				"TEXTURE has a dedicated exporter. Use --export-textures instead of --export-resource-planes.");
+		}
+
+		if (!SupportedResourceNames.Contains(resourceName))
+		{
+			throw new NotSupportedException(
+				$"{resourceName} is not supported by --export-resource-planes. Ghidra validation showed that PAW frame payloads are staged through FUN_00013040 and consumed by the queue processors at FUN_00012EA0/FUN_00012FE0 instead of being read as raw width*height indexed planes. Treat the generic raw-plane path as disabled until a family-specific decode path is proven.");
+		}
+
 		DatResourceEntry resource = dat.Resources.SingleOrDefault(resource =>
 			string.Equals(resource.Name, resourceName, StringComparison.Ordinal))
 			?? throw new InvalidDataException($"{resourceName} resource was not found in the DAT resource table.");
