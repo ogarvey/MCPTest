@@ -36,6 +36,96 @@ internal static class Program
 				Console.WriteLine($"Frames: {result.FrameCount}");
 				Console.WriteLine($"Palette banks: {result.PaletteBankCount}");
 				Console.WriteLine($"Probe palette bank: {(result.ProbePaletteBank is null ? "<none>" : result.ProbePaletteBank.Value.ToString())}");
+				Console.WriteLine($"Default palette: {result.DefaultPaletteSummary}");
+				Console.WriteLine($"Exported palette variants: {(result.ExportedPaletteVariants.Count == 0 ? "<none>" : string.Join(", ", result.ExportedPaletteVariants))}");
+				return 0;
+			}
+
+			if (!string.IsNullOrWhiteSpace(options.Type1RenderExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.Type1RenderExportPath, ".dat");
+				if (string.IsNullOrWhiteSpace(options.ResourceName))
+				{
+					throw new ArgumentException("--export-type1-renders requires --resource <name>.");
+				}
+
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				Type1RenderedExportResult result = Type1RenderedExporter.Export(dat, options.ResourceName, exportOutputPath);
+				Console.WriteLine($"Exported {result.ResourceName} exact type-1 renders to: {result.OutputDirectory}");
+				Console.WriteLine($"Blocks: {result.RenderedBlockCount}/{result.BlockCount}");
+				Console.WriteLine($"Frames: {result.FrameCount}");
+				Console.WriteLine($"Skipped frames: {result.SkippedFrameCount}");
+				Console.WriteLine($"Default palette: {result.DefaultPaletteSummary}");
+				Console.WriteLine($"Exported palette variants: {(result.ExportedPaletteVariants.Count == 0 ? "<none>" : string.Join(", ", result.ExportedPaletteVariants))}");
+				return 0;
+			}
+
+			if (!string.IsNullOrWhiteSpace(options.Type3CompositeExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.Type3CompositeExportPath, ".dat");
+				if (string.IsNullOrWhiteSpace(options.ResourceName))
+				{
+					throw new ArgumentException("--export-type3-composites requires --resource <name>.");
+				}
+
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				Type3CompositeExportResult result = Type3CompositeExporter.Export(dat, options.ResourceName, exportOutputPath);
+				Console.WriteLine($"Exported {result.ResourceName} exact type-3 composites to: {result.OutputDirectory}");
+				Console.WriteLine($"Base blocks: {result.BaseBlockCount}");
+				Console.WriteLine($"Phase entries: {result.PhaseCount}");
+				Console.WriteLine($"Composites: {result.CompositeCount}");
+				Console.WriteLine($"FUN_00038130 special variants: {result.SpecialVariantCount}");
+				Console.WriteLine($"FUN_00038130 cycle variants: {result.CycleVariantCount}");
+				Console.WriteLine($"Default palette: {result.DefaultPaletteSummary}");
+				Console.WriteLine($"Exported palette variants: {(result.ExportedPaletteVariants.Count == 0 ? "<none>" : string.Join(", ", result.ExportedPaletteVariants))}");
+				return 0;
+			}
+
+			if (!string.IsNullOrWhiteSpace(options.DisplayType3ExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.DisplayType3ExportPath, ".dat");
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				DisplayType3RuntimeExportResult result = DisplayType3RuntimeExporter.Export(dat, exportOutputPath);
+				Console.WriteLine($"Exported {result.ResourceName} exact DISPLAY type-3 runtime variants to: {result.OutputDirectory}");
+				Console.WriteLine($"Block-48 width variants: {result.GaugeWidthVariantCount}");
+				Console.WriteLine($"Block-35 filled-slot prefix variants: {result.Block35PrefixVariantCount}");
+				Console.WriteLine($"Documented-but-unrendered block count: {result.DocumentedOnlyBlockCount}");
+				Console.WriteLine($"Default palette: {result.DefaultPaletteSummary}");
+				Console.WriteLine($"Exported palette variants: {(result.ExportedPaletteVariants.Count == 0 ? "<none>" : string.Join(", ", result.ExportedPaletteVariants))}");
+				return 0;
+			}
+
+			if (!string.IsNullOrWhiteSpace(options.KnownRenderExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.KnownRenderExportPath, ".dat");
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				KnownRenderExportResult result = KnownRenderExporter.Export(dat, exportOutputPath);
+				Console.WriteLine($"Exported currently exact renderable resources for: {datPath}");
+				Console.WriteLine($"Resources: {result.ResourceCount}");
+				Console.WriteLine($"With exports: {result.ExportedResourceCount}");
+				Console.WriteLine($"With unresolved loader families: {result.UnresolvedResourceCount}");
+				Console.WriteLine($"Exporter failures: {result.FailureCount}");
+				Console.WriteLine($"Summary: {result.SummaryPath}");
+				return 0;
+			}
+
+			if (!string.IsNullOrWhiteSpace(options.ResourceCoverageReportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.ResourceCoverageReportPath, ".dat");
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				ResourceCoverageReportResult result = ResourceCoverageReporter.Export(dat, exportOutputPath);
+				Console.WriteLine($"Reported resource coverage for: {datPath}");
+				Console.WriteLine($"Resources: {result.ResourceCount}");
+				Console.WriteLine($"Runtime-referenced resources: {result.RuntimeReferencedResourceCount}");
+				Console.WriteLine($"Runtime gaps: {result.PriorityGapCount}");
+				Console.WriteLine($"Present loader types: {result.PresentLoaderTypes}");
+				Console.WriteLine($"Unhandled loader types: {result.UnhandledLoaderTypes}");
+				Console.WriteLine($"Report: {result.ReportPath}");
 				return 0;
 			}
 
@@ -73,6 +163,25 @@ internal static class Program
 				return 0;
 			}
 
+			if (!string.IsNullOrWhiteSpace(options.Type7EffectExportPath))
+			{
+				string datPath = ResolveExistingFilePath(options.Type7EffectExportPath, ".dat");
+				if (string.IsNullOrWhiteSpace(options.ResourceName))
+				{
+					throw new ArgumentException("--export-type7-effects requires --resource <name>.");
+				}
+
+				CatGunDat dat = CatGunDat.Load(datPath);
+				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
+				Type7EffectExportResult result = Type7EffectExporter.Export(dat, options.ResourceName, exportOutputPath);
+				Console.WriteLine($"Exported {result.ResourceName} exact type-7 effects to: {result.OutputDirectory}");
+				Console.WriteLine($"Blocks: {result.BlockCount}");
+				Console.WriteLine($"Frames: {result.FrameCount}");
+				Console.WriteLine($"Default palette: {result.DefaultPaletteSummary}");
+				Console.WriteLine($"Exported palette variants: {(result.ExportedPaletteVariants.Count == 0 ? "<none>" : string.Join(", ", result.ExportedPaletteVariants))}");
+				return 0;
+			}
+
 			if (!string.IsNullOrWhiteSpace(options.RawPlaneExportPath))
 			{
 				string datPath = ResolveExistingFilePath(options.RawPlaneExportPath, ".dat");
@@ -84,11 +193,14 @@ internal static class Program
 				CatGunDat dat = CatGunDat.Load(datPath);
 				string exportOutputPath = ResolveDatExportPath(datPath, options.OutputPath);
 				RawPlaneResourceExportResult result = RawPlaneResourceExporter.Export(dat, options.ResourceName, exportOutputPath);
-				Console.WriteLine($"Exported {result.ResourceName} probe assets to: {result.OutputDirectory}");
+				Console.WriteLine($"Exported {result.ResourceName} exact type-4 planes to: {result.OutputDirectory}");
 				Console.WriteLine($"Blocks: {result.BlockCount}");
 				Console.WriteLine($"Frames: {result.FrameCount}");
+				Console.WriteLine($"Skipped frames: {result.SkippedFrameCount}");
 				Console.WriteLine($"Palette banks: {result.PaletteBankCount}");
 				Console.WriteLine($"Probe palette bank: {(result.ProbePaletteBank is null ? "<none>" : result.ProbePaletteBank.Value.ToString())}");
+				Console.WriteLine($"Default palette: {result.DefaultPaletteSummary}");
+				Console.WriteLine($"Exported palette variants: {(result.ExportedPaletteVariants.Count == 0 ? "<none>" : string.Join(", ", result.ExportedPaletteVariants))}");
 				return 0;
 			}
 
@@ -231,9 +343,15 @@ internal static class Program
 		Console.WriteLine("  dotnet run -- --list [--input <path>]");
 		Console.WriteLine("  dotnet run -- --dump-dat <path-to-raw-dat>");
 		Console.WriteLine("  dotnet run -- --export-textures <path-to-raw-dat> [--output <dir>]");
+		Console.WriteLine("  dotnet run -- --export-type1-renders <path-to-raw-dat> --resource <name> [--output <dir>] (renders exact PatternWriter and 0x4D4DC helper families to PNGs)");
+		Console.WriteLine("  dotnet run -- --export-type3-composites <path-to-raw-dat> --resource <name> [--output <dir>] (exports exact type-3 composite matrices for PLAYER via FUN_00038130 and RX7_FRAMES via its same-resource base-plus-remap family)");
+		Console.WriteLine("  dotnet run -- --export-display-type3 <path-to-raw-dat> [--output <dir>] (exports exact DISPLAY block-48 runtime gauge widths plus block-35's exact filled-slot prefix, and documents the remaining substrate-dependent remap)");
+		Console.WriteLine("  dotnet run -- --export-known-renders <path-to-raw-dat> [--output <dir>] (runs the currently exact resource renderers across the whole DAT and writes a coverage summary)");
+		Console.WriteLine("  dotnet run -- --report-resource-coverage <path-to-raw-dat> [--output <dir>] (reports per-resource loader types, DAT layer references, EXE-proven named lookups, and current exact exporter coverage)");
 		Console.WriteLine("  dotnet run -- --inspect-type1-probes <path-to-raw-dat> --resource <name> [--output <dir>] (classifies loader-patched type-1 payload families and parses outer streams)");
 		Console.WriteLine("  dotnet run -- --export-type3-probes <path-to-raw-dat> --resource <name> [--output <dir>] (exports coverage masks and lookup pages for the shared type-3 remap family)");
-		Console.WriteLine("  dotnet run -- --export-resource-planes <path-to-raw-dat> --resource <name> [--output <dir>] (currently disabled pending code-proven family decoders)");
+		Console.WriteLine("  dotnet run -- --export-type7-effects <path-to-raw-dat> --resource <name> [--output <dir>] (exports REACTOR's exact first 256-frame FUN_0002A0CA cycle or LEADER's exact FUN_00054FA0()/FUN_00054EB0() script render)");
+		Console.WriteLine("  dotnet run -- --export-resource-planes <path-to-raw-dat> --resource <name> [--output <dir>] (exports exact loader type-4 indexed planes for validated resources such as DISPLAY and LEVINFO0/1/2)");
 	}
 
 	private static void PrintDatSummary(CatGunDat dat)
@@ -331,7 +449,7 @@ internal static class Program
 		return string.Join(" ", bytes.Select(value => value.ToString("X2")));
 	}
 
-	private sealed record AppOptions(string? InputPath, string? OutputPath, string? DatPath, string? TextureExportPath, string? Type1ProbeExportPath, string? Type3ProbeExportPath, string? RawPlaneExportPath, string? ResourceName, bool ListOnly, bool ShowHelp)
+	private sealed record AppOptions(string? InputPath, string? OutputPath, string? DatPath, string? TextureExportPath, string? Type1RenderExportPath, string? Type3CompositeExportPath, string? DisplayType3ExportPath, string? KnownRenderExportPath, string? ResourceCoverageReportPath, string? Type1ProbeExportPath, string? Type3ProbeExportPath, string? Type7EffectExportPath, string? RawPlaneExportPath, string? ResourceName, bool ListOnly, bool ShowHelp)
 	{
 		public static AppOptions Parse(string[] args)
 		{
@@ -339,8 +457,14 @@ internal static class Program
 			string? outputPath = null;
 			string? datPath = null;
 			string? textureExportPath = null;
+			string? type1RenderExportPath = null;
+			string? type3CompositeExportPath = null;
+			string? displayType3ExportPath = null;
+			string? knownRenderExportPath = null;
+			string? resourceCoverageReportPath = null;
 			string? type1ProbeExportPath = null;
 			string? type3ProbeExportPath = null;
+			string? type7EffectExportPath = null;
 			string? rawPlaneExportPath = null;
 			string? resourceName = null;
 			bool listOnly = false;
@@ -370,12 +494,36 @@ internal static class Program
 						textureExportPath = ReadValue(args, ref index, argument);
 						break;
 
+					case "--export-type1-renders":
+						type1RenderExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--export-type3-composites":
+						type3CompositeExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--export-display-type3":
+						displayType3ExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--export-known-renders":
+						knownRenderExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--report-resource-coverage":
+						resourceCoverageReportPath = ReadValue(args, ref index, argument);
+						break;
+
 					case "--inspect-type1-probes":
 						type1ProbeExportPath = ReadValue(args, ref index, argument);
 						break;
 
 					case "--export-type3-probes":
 						type3ProbeExportPath = ReadValue(args, ref index, argument);
+						break;
+
+					case "--export-type7-effects":
+						type7EffectExportPath = ReadValue(args, ref index, argument);
 						break;
 
 					case "--export-resource-planes":
@@ -430,12 +578,42 @@ internal static class Program
 				activeDatActions++;
 			}
 
+			if (!string.IsNullOrWhiteSpace(type1RenderExportPath))
+			{
+				activeDatActions++;
+			}
+
+			if (!string.IsNullOrWhiteSpace(type3CompositeExportPath))
+			{
+				activeDatActions++;
+			}
+
+			if (!string.IsNullOrWhiteSpace(displayType3ExportPath))
+			{
+				activeDatActions++;
+			}
+
+			if (!string.IsNullOrWhiteSpace(knownRenderExportPath))
+			{
+				activeDatActions++;
+			}
+
+			if (!string.IsNullOrWhiteSpace(resourceCoverageReportPath))
+			{
+				activeDatActions++;
+			}
+
 			if (!string.IsNullOrWhiteSpace(type1ProbeExportPath))
 			{
 				activeDatActions++;
 			}
 
 			if (!string.IsNullOrWhiteSpace(type3ProbeExportPath))
+			{
+				activeDatActions++;
+			}
+
+			if (!string.IsNullOrWhiteSpace(type7EffectExportPath))
 			{
 				activeDatActions++;
 			}
@@ -447,15 +625,15 @@ internal static class Program
 
 			if (1 < activeDatActions)
 			{
-				throw new ArgumentException("Use only one of --dump-dat, --export-textures, --inspect-type1-probes, --export-type3-probes, or --export-resource-planes at a time.");
+				throw new ArgumentException("Use only one of --dump-dat, --export-textures, --export-type1-renders, --export-type3-composites, --export-display-type3, --export-known-renders, --report-resource-coverage, --inspect-type1-probes, --export-type3-probes, --export-type7-effects, or --export-resource-planes at a time.");
 			}
 
-			if (string.IsNullOrWhiteSpace(rawPlaneExportPath) && string.IsNullOrWhiteSpace(type1ProbeExportPath) && string.IsNullOrWhiteSpace(type3ProbeExportPath) && !string.IsNullOrWhiteSpace(resourceName))
+			if (string.IsNullOrWhiteSpace(rawPlaneExportPath) && string.IsNullOrWhiteSpace(type1RenderExportPath) && string.IsNullOrWhiteSpace(type3CompositeExportPath) && string.IsNullOrWhiteSpace(type1ProbeExportPath) && string.IsNullOrWhiteSpace(type3ProbeExportPath) && string.IsNullOrWhiteSpace(type7EffectExportPath) && !string.IsNullOrWhiteSpace(resourceName))
 			{
-				throw new ArgumentException("--resource is only valid with --inspect-type1-probes, --export-resource-planes, or --export-type3-probes.");
+				throw new ArgumentException("--resource is only valid with --export-type1-renders, --export-type3-composites, --inspect-type1-probes, --export-type3-probes, --export-type7-effects, or --export-resource-planes.");
 			}
 
-			return new AppOptions(inputPath, outputPath, datPath, textureExportPath, type1ProbeExportPath, type3ProbeExportPath, rawPlaneExportPath, resourceName, listOnly, showHelp);
+			return new AppOptions(inputPath, outputPath, datPath, textureExportPath, type1RenderExportPath, type3CompositeExportPath, displayType3ExportPath, knownRenderExportPath, resourceCoverageReportPath, type1ProbeExportPath, type3ProbeExportPath, type7EffectExportPath, rawPlaneExportPath, resourceName, listOnly, showHelp);
 		}
 
 		private static string ReadValue(string[] args, ref int index, string optionName)

@@ -693,3 +693,542 @@
 	- `0x4D31C` variable-row copy payloads
 	- direct `0x4D4DC` scatter-helper payloads
 	- a still-unresolved `BB ...` signature family used by `PSTARS` and part of later `PLAYER`
+
+## 2026-05-10 - BB/BL immediate writer family recovered
+
+- The former `BB ...` unknowns are now proven to be a direct straight-line writer family, not a compressed data format.
+- Representative raw blocks disassemble to nothing but immediate loads into `EBX`/`BL` followed by direct writes into `EAX + offset` and `RET`.
+	- Examples from raw `lv01s1.dat`:
+	  - `PSTARS` block `0` at `0x6F09C`: `mov ebx, 0xCCCFCCC8`, then a short sequence of `mov [eax+disp], ebx/bx/bl`, then `ret`
+	  - `PLAYER` block `23` at `0x150A0`: `mov ebx, 0xCB8080CB`, several `mov [eax+disp], ebx/bx/bl`, one `mov [eax+disp], imm32`, then `ret`
+	  - `PLAYER` block `28` at `0x15368`: `mov bl, 0xCB`, a few byte stores, one immediate byte store, then `ret`
+- The currently observed writer encodings are all direct store forms:
+	- `BB imm32`
+	- `B3 imm8`
+	- `89 98 disp32` (`mov [eax+disp32], ebx`)
+	- `66 89 98 disp32` (`mov [eax+disp32], bx`)
+	- `88 98 disp32` (`mov [eax+disp32], bl`)
+	- `88 B8 disp32` (`mov [eax+disp32], bh`)
+	- `88 58 disp8` (`mov [eax+disp8], bl`)
+	- `C7 80 disp32 imm32`
+	- `C6 80 disp32 imm8`
+	- `C6 40 disp8 imm8`
+- DogKnife `--inspect-type1-probes` now classifies this whole bucket as `PatternWriter` instead of leaving it unknown.
+- Updated validation on raw `lv01s1.dat`:
+	- `PLAYER` type-`1` subset is now fully classified: `16` `VariableRowCopy`, `3` `ScatterWriteHelper`, `4` `PatternWriter`
+	- `PSTARS` is now fully classified: `11` `ScatterWriteHelper`, `11` `PatternWriter`
+	- `PILOT` remains `45 / 45` `VariableRowCopy`
+- Important constraint: these `PatternWriter` blocks are sparse writers over the destination surface, not full opaque planes.
+	- Example `PSTARS` block `0` declares `11 x 11`, but the recovered writes only touch offsets `0x485..0xA85` along a narrow vertical span.
+	- So this family is suitable for exact emulation, but not for a naive `width * height` raw-plane interpretation.
+
+## 2026-05-10 - Direct 0x4D4DC helper-prefix blocks can fall through into tail code
+
+- Several direct `PSTARS` blocks that start with the `50 55 90 E8 ...` helper stub do not begin with active helper data.
+- For blocks `2`, `3`, `6`, `7`, `10`, and `11`, the first 12 bytes after the stub are all zero, which means the three phase counts consumed by `0x4D4DC` are all zero.
+- In those cases the helper returns immediately to the code that follows the zero-count prefix.
+- The tail code at payload `+0x14` is itself another direct writer stub; examples:
+	- block `2` tail at `0x6F148`
+	- block `3` tail at `0x6F1EC`
+	- block `6` tail at `0x6F354`
+	- block `7` tail at `0x6F3F8`
+- Those tails include the same style of immediate pixel writes seen in the recovered `PatternWriter` family, including some `BH` byte stores and immediate dword stores.
+- So `0x4D4DC` is not just a self-contained final draw family; some direct payloads use it as a wrapper that skips empty helper phases and then continue executing tail code embedded immediately after the helper prefix.
+
+## 2026-05-10 - Exact direct renderer output now exists for `PatternWriter` and `0x4D4DC`
+
+- `DogKnife` now has `--export-type1-renders <raw-dat> --resource <name>`, which executes the exact direct type-`1` families we can currently justify from Ghidra and writes transparent grayscale PNGs.
+- The renderer executes `PatternWriter` stores directly and executes all three `0x4D4DC` helper phases (dword, word, byte) before continuing into the helper tail at the runtime `jmp esi` target.
+- The writer coverage needed one additional short word-store form, `66 89 58 <disp8>`, to finish `PSTARS` block `19`.
+- Validation on raw `lv01s1.dat`:
+	- `PSTARS`: `22 / 22` direct blocks now render successfully to `TestOutput/DatExports/lv01s1/PSTARS/type1_render`.
+	- `PLAYER`: `7 / 23` direct blocks now render successfully to `TestOutput/DatExports/lv01s1/PLAYER/type1_render`; the rendered subset is blocks `22..28`.
+- `PLAYER` blocks `0..15` are still intentionally skipped because their `0x4D31C` family remains alignment-sensitive at runtime and is not yet recovered precisely enough for a final renderer.
+
+## 2026-05-10 - Exact `0x4D31C` row progression recovered, direct `PLAYER`/`PILOT` now render fully
+
+- Ghidra-backed correction: `0x4D31C` is a 4-way alignment dispatch table at `0x4D31C` targeting copied helpers at `0x4D350`, `0x4D390`, `0x4D400`, and `0x4D470`.
+- Helper contract recovered from those copied kernels:
+	- the patched payload stub does `push eax; and eax, 3; pop edi; call [0x4D31C + eax*4]`
+	- each helper starts with `pop esi`, so `ESI` becomes the return address inside the payload
+	- the helper skips payload dword `+0x0C`, reads `rowCount` from payload `+0x10`, then processes rows inline from there
+	- per row, `destSkip` is applied relative to the end of the previous copied row, not the previous row start
+- The direct-render bug was that DogKnife advanced the `0x4D31C` destination pointer by `destSkip` only; after each row write it also has to advance by that row's copied byte count, matching the helper's `EDI` increments in Ghidra.
+- After fixing that exact row progression, the former full-stride `384x32` `PLAYER` outputs collapse to their declared sprite boxes.
+- Validation on raw `lv01s1.dat` after the fix:
+	- `PILOT`: `45 / 45` direct blocks render successfully, all at declared `30x26`
+	- `PLAYER`: `23 / 23` direct blocks render successfully, blocks `0..15` now export as declared `44x32`
+	- `PSTARS`: remains `22 / 22`
+
+## 2026-05-10 - Exact `PLAYER` type-3 composite exporter now works
+
+- `DogKnife` now has `--export-type3-composites <raw-dat> --resource PLAYER`.
+- The composite path uses the exact `FUN_00038130` phase data already recovered:
+	- base direct block set `0..15`
+	- overlay selector table `0 1 2 3 4 5 5 4 3 2 1 0`
+	- overlay blocks `16..21`
+	- overlay origin `x=5`, `y=0x11 - phaseYOffset`
+	- phase Y offsets `0 -1 -2 -4 -5 -6 -6 -5 -4 -2 -1 0`
+- Important constraint: the exporter is exact about the remap operator and recovered phase tables, but it still writes the full `base block x phase` matrix because base-block selection and remap phase are driven by different `FUN_00038130` state variables.
+- Validation on raw `lv01s1.dat`:
+	- base direct blocks exported: `16`
+	- phase entries per base: `12`
+	- total exact composites exported: `192` to `TestOutput/DatExports/lv01s1/PLAYER/type3_composite`
+
+## 2026-05-10 - Exact `FUN_00038130` branch variants now export beyond base-plus-remap
+
+- `FUN_00038130` does not stop at the direct `PLAYER` base plus the shared type-`3` remap; it also stages branch-specific direct overlays.
+- Additional state recovered from nearby PLAYER control code:
+	- `DAT_00060F32[0..1] = [0, 1]`, so the nearby `PILOT` row matches the `PLAYER` facing row directly in this state.
+	- `FUN_00038600()` maps movement/input bits from `obj + 0x4A` into `obj + 0x36D` as eight directional variants `0..7`; `FUN_00038130()` uses that value only in the special branch where `obj + 0x79 == 7`.
+	- In the normal branch (`obj + 0x79 = 0..6`), `FUN_00038130()` uses fixed `PILOT` variant `8` for the current facing row and also stages direct `PLAYER` accent blocks `22..28`.
+- The normalized positions relative to the direct `PLAYER` base are now exported exactly from the recovered call-site math:
+	- `PILOT` overlay at `(x + 7, baseTop - 7)`
+	- small direct `PLAYER` accent at `(x + 12, baseTop - 6)`
+	- shared type-`3` remap at `(x + 5, baseTop + 0x11 - phaseYOffset)`
+- `DogKnife --export-type3-composites` now writes two additional exact state-space families under `type3_composite/`:
+	- `fun38130_special`: `16 base blocks x 12 remap phases x 8 PILOT directional variants = 1536` images
+	- `fun38130_cycle`: `16 base blocks x 12 remap phases x 7 PLAYER accent states = 1344` images
+- This still does not prove the final temporal animation order, but it does move the remaining gap from rendering semantics to state sequencing.
+
+## 2026-05-10 - Batch exact-render export now covers most of `lv01s1.dat`
+
+- `DogKnife` now has `--export-known-renders <raw-dat>`, which runs the currently exact exporters across the whole DAT and writes `known_render_summary.txt` alongside the per-resource outputs.
+- Current validated coverage on raw `lv01s1.dat`:
+	- resources in DAT: `58`
+	- resources with exported assets: `53`
+	- resources with remaining unresolved loader families: `8`
+	- exporter failures: `0`
+- This command now exports, in one pass:
+	- all resources with direct type-`1` blocks via `Type1RenderedExporter`
+	- `PLAYER` direct type-`1` plus exact type-`3` composite families
+	- `TEXTURE` via the existing exact type-`4` texture exporter
+- Remaining unresolved families in `lv01s1.dat` are now a short explicit list rather than a general rendering gap:
+	- `BLOBS`: residual `type 3`
+	- `DISPLAY`: residual `type 3` and `type 4`
+	- `LEVINFO0/1/2`: `type 2` and `type 4`
+	- `REACTOR`: residual `type 7`
+	- `END`, `STOP_BLOCK`: `type 0`
+
+## 2026-05-10 - `BLOBS` grounded to its state dispatcher; exact composition still pending
+
+- `BLOBS` in `lv01s1.dat` now has concrete coverage facts:
+	- payload group `0x11303C..0x114FBC`
+	- `168` total blocks = `160` direct type-`1` blocks plus `8` shared type-`3` remap blocks
+	- direct blocks `08..167` already render exactly as `23x20`
+	- remap blocks `00..07` share one lookup page and touch only a narrow `25x3` region, so they are definitely small sparse remaps over existing pixels, not standalone planes
+- Runtime tie-in is now grounded past the resource string:
+	- state init near the `"BLOBS"` string stores the BLOBS resource handle into `DAT_000884B8`
+	- `FUN_0002CD50()` dispatches state `0x0B` by calling `FUN_0003A7B0(0)`
+	- `FUN_0003A7B0()` is not the sprite renderer; it computes/caps BLOBS viewport deltas and writes them into the global camera/clip slots at `DAT_00063508/0C/...`
+	- the state dispatch table at `fix_off32_0002C67C + 0x0B*0x10` resolves the BLOBS handler quartet as `0x3A230, 0x3A2F0, 0x3A500, 0x3A8D0`
+	- manual decode of the raw code at `0x3A2F0` now proves that this slot is the BLOBS composite renderer, not just another updater:
+		- it begins with `CALL 0x38130`, so the BLOBS state renders the normal `PLAYER` frame first
+		- it then loops `5` times and allocates two queue records per pass via `FUN_00012E30()`, which is the queue-slot allocator used by this render queue
+		- first queued record is type `1`: `record[+0x16] = 1`, `record[+0x04] = selectedBlock[+0x24]`, `record[+0x08] = base destination`
+		- second queued record is type `3`: `record[+0x16] = 3`, `record[+0x04] = overlayBlock[+0x24]`, `record[+0x0C] = overlayBlock[+0x28]`, `record[+0x08] = base destination + 0x1C7F`
+		- the phase selector uses the table at `0x3A206 = [0,1,2,3,4,5,6,7,7,6,5,4,3,2,1,0]`
+		- after each pass the phase advances by `+3 mod 16`
+		- `0x3F300()` is the visibility/output gate for this handler: it clips the BLOBS frame against the active viewport, writes the visible destination x/y back through `0x9278C` / `0x92790`, and only returns `1` when the current `25 x 22` BLOBS frame is onscreen
+		- switch table at `0x3A2D4` is now recovered exactly:
+			- state `0 -> 0x3A4CC`
+			- state `1 -> 0x3A38D`
+			- state `2 -> 0x3A3C2`
+			- state `3 -> 0x3A4B2`
+		- currently proven per-pass math from the shared tail:
+			- `slot = (obj[+0xDC] - 0x0A - 7*i) & 0x3F`
+			- `phase = (initialPhase + 3*i) & 0x0F`
+			- `directIndex = (0x20 * i) + 8 + phaseTable[phase] + (8 * (obj[+0x2E0 + slot] >> 1))`
+			- `remapIndex = directIndex & 7 = phaseTable[phase]`
+		- state `1` additionally computes fresh base coordinates from the `obj + 0xE0/+0xE4` dword-pair table using `slot`; states `0`, `2`, and `3` land inside the shared tail and deliberately skip different portions of that setup
+- Current blocker is no longer whether BLOBS uses the shared type-`3` family; that is now proven. The remaining gap is the exact per-state semantics of the `obj + 0x3A0` switch inside `0x3A2F0`, especially what state `0` and state `3` mean and how state `2` reuses or preserves base coordinates.
+
+## 2026-05-10 - `PLAYER` animation order model tightened; base and remap are separate accumulators
+
+- `FUN_00038130()` decompiles misleadingly for the first two selector fields. Raw bytes prove that, on every call, it advances:
+	- `obj + 0x370 += DAT_00093924`, then wraps modulo `0x80000`
+	- `obj + 0x374 += DAT_00093924`, then wraps modulo `0xC0000`
+	- `obj + 0x378 += DAT_0009393C`, then wraps modulo `0xC0000`
+- This means the direct `PLAYER` base frame and the type-`3` remap phase are **not** one fused animation index. They are two separate 16.16-style accumulators advanced in the same render function from the same tick source, but with different periods (`8` vs `12` steps).
+- Confirmed direct/phase selection in `FUN_00038130()`:
+	- direct base block index = `(highWord(obj+0x370) + (objFacingRow * 8))`
+	- remap phase index = `highWord(obj+0x374)`
+	- remap selector table at `0x380F8` = `0 1 2 3 4 5 5 4 3 2 1 0`
+	- remap Y-offset table at `0x380E0` = `0 -1 -2 -4 -5 -6 -6 -5 -4 -2 -1 0`
+- Discrete overlay state remains separate from those continuous accumulators:
+	- `obj + 0x79 == 7` selects the special branch
+	- `obj + 0x79 = 0..6` selects the cycle branch
+	- in the cycle branch, `obj + 0x78` is decremented after each draw; on underflow it reloads to `1` and increments `obj + 0x79`
+	- once `obj + 0x79` reaches `7`, `FUN_00038130()` no longer advances it; another function must reset it back to a cycle state
+- Nearby non-lifted state code now gives the transition picture more concretely:
+	- `0x38110` initializes the `FUN_00038130` state with `obj+0x79 = 7` and related byte flags (`7B=0, 7A=1, 7C=1, 7D=1, 7E=0`)
+	- `0x38B40` forces `obj+0x79 = 0`, but does **not** reset `obj+0x78`, `obj+0x370`, `obj+0x374`, or `obj+0x378`
+	- `0x38E50` initializes the alternate `0x38E90` family and sets motion fields (`0x20/0x34 = 0x40000`, `0x24/0x38 = 0x90000`), but also does not touch the proven `FUN_00038130` accumulator fields
+	- `0x38600` writes `obj+0x36D` from movement/input bits in `obj+0x4A`; `FUN_00038130()` only reads that field in the special branch
+	- `0x38410` drives a separate small state machine at `obj+0x36E` (`0 -> 1 -> 2 -> 0` behavior when the gated input bit is active)
+- The state tables around `fix_off32_0002C67C` now support the call-order model directly:
+	- one quartet is `0x38110, 0x38130, 0x38410, 0x38B40`
+	- a second quartet is `0x38E50, 0x38E90, 0x39270, 0x394C0`
+	- this strongly supports treating `0x38110/0x38130/0x38410/0x38B40` as one coherent PLAYER state family rather than isolated helpers
+- Best grounded current `FUN_00038130` animation-order model:
+	- continuous base phase from `obj+0x370`
+	- continuous remap/bob phase from `obj+0x374`
+	- discrete overlay/accent phase from `obj+0x79` and `obj+0x78`
+	- directional special-branch PILOT overlay from `obj+0x36D`
+- Remaining proof gap is now precise:
+	- runtime value/cadence of `DAT_00093924` and `DAT_0009393C`
+	- initial seeding/writers of `obj+0x78`, `obj+0x370`, `obj+0x374`, and `obj+0x378`
+	- exact gameplay timing of when the engine enters the `0x38110` quartet versus the `0x38E50` quartet
+
+## 2026-05-10 - `PLAYER` timer globals still have no static writers; nearby pre-states use a different bank
+
+- Fresh xref passes over the whole nearby timer cluster still show only static reads for `DAT_00093924`, `DAT_00093928`, `DAT_0009392C`, `DAT_00093934`, `DAT_00093938`, and `DAT_0009393C` in `CATDEC.LE`; no normal `WRITE` xrefs surfaced for any of them.
+- The two odd `DAT_0009393C` data refs at `0x31A2A` and `0x4734A` are not hidden writers for the `PLAYER` selectors. Manual decode shows they are just more readers inside other update routines that subtract/add the same global delta.
+- Raw decode of the neighboring non-lifted code at `0x37A30` and `0x37DA0` proves those handlers are using a separate selector/timer family:
+	- `0x37A30` initializes `obj+0x7A..0x7E`, `obj+0x360 = 0`, `obj+0x364 = 3`, and motion fields `0x20/0x24/0x34/0x38`; it then advances `obj+0x360 += DAT_00093924`, `obj+0x33C += DAT_00093928`, and `obj+0x368 += DAT_0009393C`
+	- `0x37DA0` writes `obj+0x365` and drives motion/clamp banks at `obj+0x1C/0x1E/0x20` and `obj+0x30/0x32/0x34`
+	- neither region writes or seeds `obj+0x78`, `obj+0x79`, `obj+0x370`, `obj+0x374`, or `obj+0x378`
+- Raw decode of the known quartet entry points tightens the boundary further:
+	- `0x38110` sets `obj+0x79 = 7` plus byte flags `7B=0, 7A=1, 7C=1, 7D=1, 7E=0`, but does not touch `obj+0x78/0x370/0x374/0x378`
+	- `0x38B40` forces `obj+0x79 = 0`, but again does not seed `obj+0x78/0x370/0x374/0x378`
+	- `0x38E50` initializes the alternate family (`7B=1, 7A=0, 7C=0, 7D=0, 7E=0`, motion fields `0x20/0x24/0x34/0x38`) and also does not touch the `FUN_00038130` accumulator bank
+- Best current grounded conclusion: the unresolved part of exact `PLAYER` animation order is no longer local to the nearby PLAYER-family handlers. The missing proof is now either a more distant object-seeding path for `obj+0x78/0x370/0x374/0x378` or an external/runtime-fed source for the `0x93924..0x9393C` delta globals.
+
+## 2026-05-10 - `PLAYER` state table layout and concrete state IDs are now proven
+
+- The actual per-state record base is `fix_off32_0002C678`, not `fix_off32_0002C67C`. Each state occupies `0x10` bytes = four function pointers.
+- Four sibling dispatchers now account for the four slots directly:
+	- `FUN_0002CC00()` calls `[0x2C678 + state*0x10]`
+	- `FUN_0002CD50()` calls `[0x2C67C + state*0x10]`
+	- `FUN_0002CE80()` calls `[0x2C680 + state*0x10]`
+	- `FUN_0002D290()` calls `[0x2C684 + state*0x10]` when `obj+0x58 == 0`
+- That makes the previously inferred PLAYER quartets exact state records rather than loose neighboring code:
+	- state `0x01` = `0x38110, 0x38130, 0x38410, 0x38B40`
+	- state `0x04` = `0x38E50, 0x38E90, 0x39270, 0x394C0`
+	- state `0x05` = `0x397E0, 0x38E90, 0x39270, 0x394C0`
+	- state `0x0B` = `0x3A230, 0x3A2F0, 0x3A500, 0x3A8D0` (`BLOBS`)
+	- state `0x0E` = `0x38E50, 0x38E90, 0x39270, 0x394C0`
+	- state `0x0F` = `0x37A30, 0x37AC0, 0x37DA0, 0x38050`
+- The earlier neighboring bank result now fits this table cleanly:
+	- state `0x01` is the proven `FUN_00038130` family with the unresolved `0x78/0x79/0x370/0x374/0x378` cadence question
+	- state `0x0F` and state `0x00` use the separate `0x33C/0x360/0x364/0x365/0x368` bank instead
+	- state `0x04/0x05/0x0E` are the alternate family and still do not seed the `FUN_00038130` accumulator bank
+- This materially narrows the gameplay-order question: “enter the `0x38110` quartet versus the `0x38E50` quartet” is now equivalent to proving writes that move `DAT_0008849B` between state IDs `0x01` and `0x04/0x05/0x0E`.
+
+## 2026-05-10 - Raw DAT header now proves both the top-level state byte and palette selector bytes
+
+- `FUN_0002A630()` is the clean writer that had been missing from the normal `DAT_0008849B` xref surface. After it loads `map/<name>.dat` into `DAT_00060C00`, it assigns:
+	- `DAT_0008849B = DAT_00060C00[0x00]`
+	- `DAT_0008849A = DAT_00060C00[0x01]`
+	- `DAT_000655BB = DAT_00060C00[0x0B]`
+	- `DAT_000655BE = DAT_00060C00[0x0C]`
+	- `DAT_0006557C = DAT_00060C00 + *(int *)(DAT_00060C00 + 0x54)`
+- This means the same raw DAT header already being parsed by DogKnife contains code-proven palette selector bytes, not just the palette-bank array at offset `0x54`.
+- `FUN_0002A500()` resets `DAT_000655BB`, `DAT_000655BE`, and the adjacent control bytes to `0` before calling `FUN_0002A630()`, so the header values are authoritative loader inputs rather than leftovers from an earlier scene.
+- `FUN_000110A0()` now gives the top-level state picture concretely:
+	- it switches directly on `DAT_0008849B`
+	- state `0x08` is the level/gameplay init path that calls `FUN_0002C470()` (PLAYER setup) and then `FUN_00020FC0()`
+	- after that state-`0x08` path, it explicitly calls `FUN_0003DD90(DAT_0006557C, 0, 0x20000)`
+- Palette implications are now much tighter:
+	- `FUN_0003B000(bank, ...)` targets `DAT_0006557C + bank * 0x300`
+	- `FUN_00049640()` uses `DAT_000655BB` as one code-proven bank selector
+	- `FUN_00020FC0()` uses `DAT_000655BE` as another code-proven bank selector and copies from derived banks like `DAT_000655BE + 1`
+	- for state `0x08`, bank `0` is also explicitly passed into the palette transition helper through `FUN_0003DD90(DAT_0006557C, 0, 0x20000)`
+- Practical exporter consequence: DogKnife no longer needs to rely only on the old `TEXTURE` block-field heuristic. The raw DAT itself now provides three code-grounded palette candidates worth exporting side-by-side: state-`0x08` bank `0`, header byte `0x0B` (`DAT_000655BB`), and header byte `0x0C` (`DAT_000655BE`).
+
+## 2026-05-10 - `lv01s1.dat` palette validation: header bank `0x0B` is actionable, state-`0x08` bank `0` is not
+
+- A real DogKnife validation run against `TestOutput/BLK_Raw/map/lv01s1.dat` now confirms the loader/header facts on an actual level DAT:
+	- `Type = 0x0B`
+	- header bytes `0x08..0x0C = 5, 10, 8, 9, 10`
+	- palette bank count parsed from the DAT = `10` (`0..9` valid)
+- Because `lv01s1.dat` is type `0x0B`, the state-`0x08` startup rule does **not** apply to this file, so DogKnife correctly did **not** export a bank-`0` variant here.
+- The new `TEXTURE` exporter emitted two non-grayscale, grounded palette variants for this DAT:
+	- `palette_bank_09_header_0B` from header byte `0x0B` / `DAT_000655BB`
+	- `palette_bank_03_block_value20` from the older shared-`value20` TEXTURE heuristic
+- Header byte `0x0C` was `10`, which is out of range for a `10`-bank palette region (`0..9` valid), so no `header_0C` variant was exported for `lv01s1.dat`.
+- Current best palette-reading posture is therefore more precise than before:
+	- treat DAT header bytes `0x0B/0x0C` as code-proven palette selectors
+	- export them when they point inside the parsed palette-bank array
+	- only add the explicit bank-`0` startup candidate when the DAT header `Type` is `0x08`
+	- keep the old block-field palette bank only as a labeled legacy heuristic for comparison
+
+## 2026-05-10 - Exact type-`1` and type-`3` exporters now emit colored palette variants too
+
+- DogKnife now applies the same code-grounded DAT palette logic to the exact sprite renderers, not just `TEXTURE`:
+	- `Type1RenderedExporter` still writes the legacy grayscale outputs, but now also emits palette-colored variants for any in-range code-proven banks from the DAT header
+	- `Type3CompositeExporter` does the same for `PLAYER` base blocks, phase composites, and the grounded `FUN_00038130` special/cycle branch exports
+- The palette logic shared across those exporters is now:
+	- `header[0x0B] -> DAT_000655BB` candidate bank
+	- `header[0x0C] -> DAT_000655BE` candidate bank
+	- `bank 0` only when `header[0x00] == 0x08`, because the state-`0x08` startup path explicitly calls `FUN_0003DD90(DAT_0006557C, 0, 0x20000)`
+	- missing/invalid palette regions no longer break the exact renderers; they fall back to grayscale-only and record that in metadata
+- Validation on `lv01s1.dat` (`Type = 0x0B`, header `0x0B/0x0C = 9/10`, palette bank count `10`) is now concrete:
+	- `PLAYER` type-`1` exact export succeeded and emitted `palette_bank_09_header_0B`
+	- `PLAYER` type-`3` exact composite export succeeded and emitted `palette_bank_09_header_0B`
+	- `PILOT` type-`1` exact export also succeeded and emitted `palette_bank_09_header_0B`
+	- no `header_0C` variant was emitted because bank `10` is out of range for this DAT
+- Practical consequence: for level DATs like `lv01s1.dat`, the exact sprite exporters are no longer limited to grayscale proof images. We now get side-by-side colored outputs using the best code-grounded bank(s) from the DAT header itself.
+
+## 2026-05-10 - The remaining type-`0x0B` palette mismatch is a live-palette composition issue, not a VGA expansion bug
+
+- The hardware write path is now explicit in Ghidra:
+	- `FUN_0004CDA3()` writes the live shadow palette at `DAT_0009F968` straight to VGA DAC ports `0x3C8/0x3C9`
+	- it outputs the stored bytes directly; there is no extra brighten/gamma step after the palette bytes leave `DAT_0009F968`
+	- so DogKnife's `0..63 -> 0..255` conversion is not the source of the "too dark" symptom
+- The type-`0x0B` scene path for `lv01s1.dat` is now clearer too:
+	- `FUN_000110A0()` dispatches state `0x0B` to `FUN_00014010()`
+	- the active frame/update loop reaches `FUN_0003E760()`
+	- when `DAT_000602AA != 0`, that loop calls `FUN_00049640()`
+	- `FUN_0003B1A0(param_1 != 0)` is one concrete writer of `DAT_000602AA = 1`, so this is a one-shot palette-trigger path rather than a generic always-on bank select
+- The exact palette operations around that path are now grounded:
+	- `FUN_0003DD30()` zeroes `DAT_0009F968`, zeroes the transition work buffers, sets `DAT_000938E0 = 1`, and immediately writes the all-black live palette to VGA
+	- `FUN_00049640()` then does **not** replace the whole palette with one bank
+	- instead it calls `FUN_0003DD90(DAT_0006557C + DAT_000655BB * 0x300, start=0, count=0x80, duration=0x20000)`, which only schedules a transition for entries `0x00..0x7F`
+	- then it calls `FUN_0003E080(DAT_0006557C + DAT_000655BE * 0x300, start=0xE0, count=0x20)`, which directly copies only entries `0xE0..0xFF` into `DAT_0009F968` and writes them to VGA immediately
+	- that means the live type-`0x0B` palette is a composed runtime state, not a flat `header[0x0B]` bank dump
+- Direct export evidence from DogKnife now explains why the current colored outputs can still be "close but dark":
+	- `PLAYER/type1_render/grayscale/blocks/block_00_44x32.png` uses only palette indices `0xE0..0xEB`
+	- `PLAYER/type1_render/grayscale/blocks/block_22_19x11.png` uses only palette indices `0xCB..0xCE`
+	- so the direct `PLAYER` resource does not mainly live in the low half that `FUN_00049640()` transitions from `DAT_000655BB`
+	- a flat `palette_bank_09_header_0B` export is therefore only a comparison candidate for type-`0x0B` sprites, not the exact live palette state
+- For `lv01s1.dat` specifically, the `FUN_00049640()` upper-slice source is now also checked against raw bytes:
+	- header byte `0x0C` / `DAT_000655BE` is `10`
+	- the exact raw source window used by `FUN_00049640()` for entries `0xE0..0xFF` starts at `0x118D7C`, which lies **outside** the parsed `0x116CDC..0x118ADC` palette-bank region but still inside the file
+	- the first `0x20 * 3` bytes at that raw source are all zero in `lv01s1.dat`
+	- therefore `FUN_00049640()` alone cannot explain the bright in-game top-range sprite colors for this DAT; some later palette write/copy path still remains unresolved
+- New working conclusion:
+	- do **not** treat the current darkness as a VGA expansion bug
+	- do **not** treat `palette_bank_09_header_0B` as the exact runtime palette for type-`0x0B` scene sprites
+	- the remaining job is to identify the later writer(s) that patch `DAT_0009F968` after the initial `FUN_00049640()` scene setup
+
+## 2026-05-10 - Palette-bank preview export added, and one palette-script path ruled out for plain level rendering
+
+- DogKnife now exports palette-bank previews alongside the palette-aware outputs:
+	- each palette-aware export root now contains `palette_banks/original_vga6bit` and `palette_banks/converted_8bit`
+	- every parsed bank gets two swatch-sheet PNGs:
+		- `original_vga6bit/bank_##.png` renders the raw `0..63` VGA DAC triplets directly as dark RGB swatches
+		- `converted_8bit/bank_##.png` renders the same bank after the normal `0..63 -> 0..255` expansion used for PNG output
+	- `palette_banks/metadata.txt` lists every generated bank preview file
+	- the main export `metadata.txt` now points back to those preview directories
+- Validation on `lv01s1.dat` is concrete:
+	- `TEXTURE`, exact `PLAYER` type-`1`, and exact `PLAYER` type-`3` exports all emitted `palette_banks/original_vga6bit` and `palette_banks/converted_8bit`
+	- for `lv01s1.dat`, each preview directory contains `bank_00.png` through `bank_09.png`
+- Tracing update on the remaining live-palette writer path:
+	- `FUN_00054EB0()` is the interpreter that dispatches palette-script opcodes, including opcode `0x0B -> FUN_00054E20()` for direct palette segment writes into `DAT_0009F968`
+	- but the discovered `FUN_00054EB0()` call chain currently sits under `FUN_00036FC0()` / `FUN_00036F40()`, which is the `LEADER` mode path (`FUN_0002C150("LEADER")`), not the plain `lv01s1.dat` level wrapper `FUN_00010E40()`
+	- so that script interpreter is real and important, but it is **not yet** the missing proof for the ordinary type-`0x0B` level palette seen during normal `lv01s1.dat` gameplay
+- Current best next tracing target remains the ordinary level loop around `FUN_00010E40() -> FUN_0003E3C0() -> FUN_0003E760()` and the unresolved callers that eventually trigger `FUN_0003B1A0()` / `DAT_000602AA`
+
+## 2026-05-10 - The render queue is palette-agnostic; palette banks are consumed by scene/state code
+
+- New proof from the ordinary render path:
+	- sprite/object renderers like `FUN_00038130()` choose sprite records and destination addresses, but do **not** pass a palette-bank selector
+	- queued draw records allocated by `FUN_00012D40()` / `FUN_00012E30()` are 0x18-byte command records with fields used for:
+		- function pointer at `+0x04`
+		- destination pointer at `+0x08`
+		- optional extra pointer/data at `+0x0C`
+		- operation type byte at `+0x16`
+	- no palette-bank field appears in those draw records
+	- queue execution in `FUN_00012FE0()` dispatches only by that type byte:
+		- type `< 2`: call function pointer with the queued destination/data
+		- type `3`: call `FUN_00028A00()`
+	- `FUN_00028A00()` is byte-level compositing/copying inside the indexed framebuffer, not a palette selector
+	- `FUN_00046000()` is also not a palette selector; it remaps framebuffer indices through a 32-byte-wide lookup table (`destIndex + sourceIndex * 0x20`)
+- New proof from the palette side:
+	- the DAT palette-bank table base `DAT_0006557C` is written once by `FUN_0002A630()` when the DAT is loaded
+	- the currently proven consumers of `DAT_0006557C` are palette/state functions such as:
+		- `FUN_000110A0()` startup/state init
+		- `FUN_00010E40()` post-loop copy of bank 0 into the live palette
+		- `FUN_0003B000()` palette transition helper
+		- `FUN_00049640()` type-`0x0B` scene palette composition
+		- `FUN_00020FC0()` state-8 palette setup
+		- `FUN_0004A820()` another mode/state palette transition
+	- no proven sprite-queue or sprite-blit function currently reads `DAT_0006557C`
+- Runtime palette model now proven more tightly:
+	- multiple palette banks can exist in the DAT, but the renderer still uses a single live VGA palette shadow at `DAT_0009F968`
+	- `FUN_0003E080()` copies palette slices into that single live shadow and immediately calls `FUN_0004CDA3()`
+	- `FUN_0004CDA3()` writes that single live shadow directly to VGA DAC ports `0x3C8/0x3C9`
+	- therefore the current evidence supports **scene/state-level palette selection/composition**, not a per-graphic palette-bank selector in the render queue
+- Practical exporter consequence:
+	- using the same DAT-wide palette reference variants for all resource exports is consistent with the proven runtime model so far
+	- what remains unresolved is **which scene/state code produces the final live palette for `lv01s1.dat`**, not a missing per-resource palette-bank field in the sprite renderer
+
+## 2026-05-10 - Type `0x0B` starts from bank 0, then applies later slice-specific palette changes
+
+- `lv01s1.dat` header bytes directly confirm it is a type-`0x0B` DAT:
+	- header bytes begin `0B 63 00 00 00 00 10 00 05 0A 08 09 0A`
+- `FUN_000110A0()` does not leave the type-`0x0B` startup palette ambiguous anymore:
+	- the table byte at `DAT_00010E1F[0x0B]` is `0x01`
+	- for that value, `FUN_000110A0()` sets the palette mode bits and then calls `FUN_0003DD90(DAT_0006557C, 0, 0x20000)`
+	- therefore the ordinary type-`0x0B` scene starts from a **full live-palette transition from bank 0**
+- Newly decoded type-`0x0B` dynamic palette handlers then replace selected slices after that bank-0 baseline:
+	- raw block around `0x1411C` counts down `DAT_000602F8`; when it underflows, it calls `FUN_0003DD90(DAT_0006557C + DAT_000602F4 * 0x300, 1, 0x6000)` with count `0x7F`, then toggles `DAT_000602F4 ^= 1`
+		- practical effect: low-slice transition between banks 0 and 1
+	- raw block around `0x14EC7` calls `FUN_0003DD90(DAT_0006557C + 0x1500, 1, 0x20000)` with count `0x7F`
+		- `0x1500 / 0x300 = 7`, so this is a low-slice transition from bank 7
+	- raw block around `0x1527A` calls `FUN_0003DD90(DAT_0006557C + (byte[+0x9C] + 2) * 0x300, 0x60, 0x8000)` with count `0x20`
+		- practical effect: a mid-slice transition driven by an object field, not a fixed DAT header byte
+- Important negative result from the nearby startup/object sequence:
+	- the `0x14F80` call to `FUN_0003B1A0()` is preceded by `xor eax, eax`, so it is `FUN_0003B1A0(0)`
+	- `FUN_0003B1A0(0)` does **not** set `DAT_000602AA`; it instead calls `FUN_0003DE70(0x20000, 0)`
+	- so this nearby startup path does **not** immediately arm `FUN_00049640()`'s `DAT_000602AA`-gated upper-slice update
+- Current best interpretation for static `PLAYER` exports:
+	- bank 0 is no longer just a comparison palette; it is the proven type-`0x0B` scene-start baseline
+	- later low/mid slice transitions are real and code-proven, but the exact later writer responsible for the bright final upper-range `PLAYER` colors is still unresolved
+
+## 2026-05-10 - Cross-resource palette model: scene-global live palette plus narrow index-remap families
+
+- The bank-0 type-`0x0B` startup baseline is not `PLAYER`-specific:
+	- running the shared DogKnife palette-aware `TEXTURE` export on `lv01s1.dat` now emits the same proven baseline variant:
+		- `palette_bank_00_state0B_start=bank00`
+		- `palette_bank_09_header_0B_low_slice_reference=bank09`
+		- plus the existing `TEXTURE` probe variant `palette_bank_03_block_value20=bank03`
+	- therefore the shared helper change is applicable across at least one non-`PLAYER` graphic family in the same DAT
+- Default render architecture still supports one scene-global live palette for most graphics:
+	- generic queued draw helper `FUN_00013040()` has 98 xrefs in the current program and still carries no palette-bank field in its draw records
+	- `FUN_00013430()` and `FUN_00038130()` likewise enqueue graphics without any palette-bank parameter
+	- this remains the strongest evidence that most graphics in a DAT consume the same current live palette rather than per-resource palette banks
+- Two narrow special render families now stand out, but neither is a per-resource palette-bank selector:
+	- `FUN_000473B0() -> FUN_00047410() -> FUN_00046000()`
+		- `FUN_000473B0()` first runs a special draw through `FUN_00047410()`, then falls back to a normal queued draw through `FUN_00013040()`
+		- `FUN_00047410()` is the only proven consumer of `DAT_00099574`
+		- `FUN_00046000()` rewrites framebuffer indices through `destIndex + sourceIndex * 0x20`, i.e. an index remap table, not a palette bank
+	- `0x47CD0/0x47DBD -> FUN_00048500()` family
+		- setup around `0x482A0` seeds state from `DAT_0006557C` via `FUN_0003E080()` and initializes `DAT_00099580/88/90/94`
+		- `FUN_00048500()` is a geometry/index-space transform using trigonometric lookup table `DAT_00011438` and the `DAT_0009958x` state; it does not read `DAT_0006557C`, `DAT_000655BB`, or `DAT_000655BE`
+		- so this is another special indexed rendering/remap path layered on top of the live palette, not a competing palette-bank selection mechanism
+- Current exporter implication:
+	- for most graphics, the right palette model is still the reconstructed scene-global live palette
+	- for the narrow special families above, the right output model is live palette **plus** path-specific index remap/transform logic
+	- the remaining missing piece for exact colors is still the unresolved later live-palette writer for the bright upper-range colors, not a hidden per-resource bank selector
+
+## 2026-05-10 - Palette selection is scene-global, not per resource
+
+- The current strongest selector model is now explicit:
+	- `FUN_0002A630()` loads the DAT and stores three palette-selection globals:
+		- `DAT_0006557C` = palette table base pointer from DAT header offset `+0x54`
+		- `DAT_000655BB` = DAT header byte `0x0B`
+		- `DAT_000655BE` = DAT header byte `0x0C`
+	- generic queued draw paths still have no palette-bank field, so sprites/UI elements are not matched to banks individually; they use the current scene-global live palette
+- Type `0x0B` map-scene rule for `lv01s1.dat`:
+	- `FUN_000110A0()` starts the scene from full bank 0 (`FUN_0003DD90(DAT_0006557C, 0, 0x20000)`)
+	- later `FUN_00049640()` does **not** switch the whole scene to the last bank:
+		- indices `0x00..0x7F` are taken from bank `DAT_000655BB` (bank 9 here)
+		- indices `0xE0..0xFF` are rewritten from `DAT_000655BE`-related input only
+		- in `lv01s1.dat`, `DAT_000655BE == 10` while the static bank list is `0..9`, so byte `0x0C` is not acting as a direct bank index for this DAT
+	- conclusion: the correct runtime palette for map-scene graphics is often a hybrid live palette, not one of the 10 static banks by itself
+- Other proven palette selectors:
+	- `FUN_0004A820()` performs a full-bank transition from `DAT_000655BE` after `FUN_000110A0()`; this is a scene/mode-level override, not a per-resource choice
+	- `FUN_00020FC0()` builds a derived working palette from `DAT_000655BE` and `DAT_0006557C`, again at scene/mode level
+	- helper `FUN_0003B000(param1)` and event path `FUN_0003DA80()` can swap the low slice (`1..0x7F`) to banks `param1` / `0..3` during scripted runtime changes
+- Practical export rule:
+	- there is no code-proven `resource -> bank N` mapping for generic graphics
+	- the correct palette choice comes from the scene/state handler currently owning the screen, not from the sprite/UI resource itself
+
+## 2026-05-10 - DogKnife now writes a scene-level `default/` palette export
+
+- Implemented a shared default palette path in `DatPaletteHelper` and the active exporters (`TEXTURE`, type-`1`, type-`3`):
+	- exports now write a `default/` tree alongside `grayscale/` and the diagnostic bank variants
+	- `default/` uses the best currently proven scene-level palette strategy instead of hard-wired grayscale when one exists
+- Current default strategy rules:
+	- type `0x0B`: best-effort hybrid live palette = bank 0 baseline + `0x00..0x7F` from bank `DAT_000655BB`; `0xE0..0xFF` also comes from `DAT_000655BE` only if that header byte is a valid static bank index, otherwise the bank-0 baseline is kept for that tail
+	- proven bank-0 startup types currently default straight to bank 0
+	- all other DAT types still fall back to grayscale until their scene-level palette strategy is proven
+- Validation:
+	- `dotnet build DogKnife.csproj` succeeded after the change
+	- `PLAYER` type-`1`, `TEXTURE`, and `PLAYER` type-`3` exports for `lv01s1.dat` now all emit `default/` outputs and report the applied default palette summary in both CLI output and metadata
+	- `--export-known-renders` against `lv01s1.dat` completed with 53 exported resources, 0 exporter failures, and the expected `default/` trees present in the currently exact export families (`TEXTURE`, type-`1`, type-`3`)
+
+## 2026-05-10 - `FUN_00049640()` is gated and not part of the traced `lv01s1` startup baseline
+
+- New proof tightening the type-`0x0B` model:
+	- direct raw-file probe for `lv01s1.dat` shows the bytes at the static source range that `FUN_00049640()` would use for `0xE0..0xFF` when `DAT_000655BE == 10` are all zeroes
+	- `FUN_00049640()` has exactly one caller: `FUN_0003E760()`
+	- `FUN_0003E760()` only calls `FUN_00049640()` when `DAT_000602AA != 0`
+	- `DAT_000602AA` is only written by `FUN_0003B1A0()`:
+		- `FUN_0003B1A0(1)` arms `DAT_000602AA = 1`
+		- `FUN_0003B1A0(0)` does not arm it; it instead routes through `FUN_0003DE70(0x20000, 0)`
+	- the currently traced `lv01s1` startup path still reaches the known `0x14F80 -> FUN_0003B1A0(0)` case, not a proven `FUN_0003B1A0(1)` path
+- Current implication:
+	- the exact bright final upper tail for `lv01s1` is still unresolved
+	- but the evidence now argues more strongly that `FUN_00049640()` is **not** part of the traced normal startup baseline for this DAT, which makes the current default of keeping `0xE0..0xFF` on the bank-0 baseline more defensible than assuming a hidden switch to the last static bank
+
+## 2026-05-10 - Exact loader type-`4` plane export now covers `DISPLAY` and `LEVINFO*`
+
+- The old generic `--export-resource-planes` path is no longer a blanket disabled probe.
+	- It is now narrowed to the currently validated loader type-`4` plane families: `DISPLAY`, `LEVINFO0`, `LEVINFO1`, and `LEVINFO2`.
+	- `TEXTURE` still keeps its dedicated exporter.
+	- Other families like `PAW` remain excluded because the code proof still shows queued helper/decoder execution rather than a direct width-times-height indexed plane read.
+- Implementation details:
+	- the exporter now renders only loader type-`4` blocks from a mixed payload group
+	- it writes the same scene-level `default/` palette output tree plus grayscale and palette-variant diagnostics used by the other exact renderers
+	- sequence entries that point at non-type-`4` blocks are skipped explicitly instead of being guessed as raw planes
+- Validation on `lv01s1.dat`:
+	- `LEVINFO1` exports cleanly as `1` exact type-`4` block and `1` frame with `0` skipped frames
+	- `LEVINFO0` exports `1` exact type-`4` block and `5` frames with `25` skipped non-type-`4` sequence entries, which matches its `00 01 02 03 04 05` repeating sequence against a payload group that contains `0x02:42, 0x04:1`
+	- `DISPLAY` exports its single exact type-`4` block with no sequence frames
+	- rerunning `--export-known-renders` on `lv01s1.dat` now raises `Resources with exports` from `53` to `56`, with `0` exporter failures
+- Updated exact coverage summary for `lv01s1.dat`:
+	- `DISPLAY`: exported `type4 planes, type1 renders`, unresolved residual `0x03`
+	- `LEVINFO0/1/2`: exported `type4 planes`, unresolved residual `0x02`
+	- remaining unresolved families are now `BLOBS`/`DISPLAY` type `0x03`, `LEVINFO*` type `0x02`, `REACTOR` type `0x07`, and `END`/`STOP_BLOCK` type `0x00`
+
+## 2026-05-10 - `REACTOR` loader type-`0x07` recovered as an exact particle/effect family
+
+- The residual `REACTOR` type-`0x07` block is not another sprite plane or executable blit blob.
+	- `BBREACTOR`'s spawn stub at `0x149B0` is another entity initializer built on `FUN_000136E0()` and `FUN_0002C2C0()`.
+	- its object state at `0x14A30` advances through the handler rooted at `0x14CA0`.
+	- state flow at `0x14F24` creates a child object with handler `0x14F90` and stores `resource->p04 + 0x13A4`, which is exactly `REACTOR` block `104`'s `Value24`, into the child at `+0x74`.
+	- `0x14F90` then calls `FUN_0002A0CA()` on that pointer.
+- `FUN_0002A0CA()` gives the block format directly:
+	- it consumes a fixed `0x1000` records from the `0xA000`-byte region at block `104`'s `Value24 = 0x5EE94`
+	- each record is `10` bytes:
+		- `u16 x` in `9.7` fixed point
+		- `u16 y` in `9.7` fixed point
+		- `s16 dx`
+		- `s16 dy`
+		- `u8 colorIndex`
+		- `u8 delayCounter`
+	- active records plot one pixel at `(x >> 7, y >> 7)`, then update `x += dx`, `y += dy`, and `dy += 5`
+	- the first `256` frames form one exact deterministic cycle across all `4096` records because the delay field spans `0..255` and each record fires once per cycle
+- Important exactness result:
+	- the first `256` frames for `lv01s1.dat` block `104` do **not** reach the later `FUN_0002BD08()` RNG reset path, so this first-cycle export is exact without needing any external/random runtime state
+- DogKnife implementation:
+	- new command: `--export-type7-effects <raw-dat> --resource REACTOR`
+	- exporter path: `REACTOR/type7_effect`
+	- emits `default/`, `grayscale/`, and palette-variant frame sets plus a cycle-coverage image using the shared scene-level palette logic
+- Validation:
+	- direct export on `lv01s1.dat` succeeded: `1` type-`7` block, `256` exact frames, `0` exporter failures
+	- rerunning `--export-known-renders` now clears `REACTOR`'s residual unresolved loader family and reduces whole-DAT unresolved-resource count from `8` to `7`
+- Updated unresolved set for `lv01s1.dat`:
+	- `BLOBS`: residual `type 3`
+	- `DISPLAY`: residual `type 3`
+	- `LEVINFO0/1/2`: residual `type 2`
+	- `END`, `STOP_BLOCK`: `type 0`
+
+## 2026-05-10 - `DISPLAY` type-`3` is now split into one exact runtime family plus one still-substrate-dependent remap
+
+- The `DISPLAY` initializer is now grounded too:
+	- string xref `"DISPLAY"` leads to `FUN_0002FD20()`
+	- that resolver stores the resource entry in `DAT_0008B9B4` and the payload-group base in `DAT_0008B9BC`
+	- state `0x0B` selects the handler rooted at `0x2FA80`
+- `DISPLAY` block `48` is now an exact runtime bar/gauge family, not a guessed standalone sprite:
+	- `FUN_0002EFE0()` case `1/2` reaches `FUN_0002F5C0()`
+	- `FUN_0002F5C0()` computes `filledWidth = (value + 0x1FFFFF) >> 21`
+	- for `filledWidth > 0`, `FUN_0002F6A0()` copies exactly that many columns from type-`4` block `47`
+	- for `filledWidth < 32`, the same function then patches block `48`'s `FUN_00028A00()` stream in place at payload offsets `+0x924..+0x938` and applies it at `x = filledWidth`
+	- this yields a deterministic exact `0..32` width family over the proven block-`47` substrate
+- `DISPLAY` block `35` is also now tied to a concrete runtime path, but its exact substrate is still unresolved:
+	- `FUN_0002EDA0()` uses payload offsets `+0x6B4/+0x6B8`, which are block `35`'s stream/page pair
+	- it draws type-`1` blocks `17..24` at `+5` x-strides first, then applies block `35` up to eight times for the remaining slots
+	- this proves block `35` is live and shared through `FUN_00028A00()`, but not yet which exact pre-drawn HUD substrate it remaps over in the final framebuffer
+- DogKnife implementation:
+	- new command: `--export-display-type3 <raw-dat>`
+	- exporter path: `DISPLAY/type3_runtime`
+	- emits the exact block-`48` width matrix (`33` variants for widths `0..32`) in `default/`, `grayscale/`, and palette-variant trees
+	- metadata now documents the separate block-`35` runtime path instead of pretending `DISPLAY` type-`3` is fully closed
+- Validation:
+	- direct export on `lv01s1.dat` succeeded: `33` exact block-`48` width variants, `1` documented-but-unrendered block (`35`)
+	- rerunning `--export-known-renders` succeeds with `0` failures and keeps the unresolved-resource count at `7`
+	- `known_render_summary.txt` now reports `DISPLAY: exported=type4 planes, type1 renders, DISPLAY type3 runtime unresolved=0x03 failure=<none>`

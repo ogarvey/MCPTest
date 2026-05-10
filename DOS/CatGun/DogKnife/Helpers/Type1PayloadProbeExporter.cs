@@ -5,6 +5,7 @@ namespace DogKnife.Helpers;
 
 internal static class Type1PayloadProbeExporter
 {
+	private const int RuntimeStride = 0x180;
 	private const uint Signature4D100 = 0xE083F88B;
 	private const uint Signature4D31C = 0x03E08350;
 	private const uint Signature4D4DC = 0xE8905550;
@@ -133,6 +134,23 @@ internal static class Type1PayloadProbeExporter
 				Notes: "Patched to 0x4D4DC via the inline CALL at payload+0x04. This is the nested scatter-write helper family; stream starts at payload+0x08.");
 		}
 
+		if (TryParsePatternWriter(bytes, block.Value24, out Type1PatternWriterSummary patternWriter))
+		{
+			return new Type1PayloadBlockSummary(
+				BlockIndex: block.Index,
+				Family: Type1PayloadFamily.PatternWriter,
+				Signature: FormatSignature(signatureBytes),
+				PayloadOffset: block.Value24,
+				PrimaryStreamOffset: block.Value24,
+				PrimaryStreamEndOffset: patternWriter.EndOffset,
+				SecondaryStreamOffset: null,
+				DeclaredWidth: block.Value08,
+				DeclaredHeight: block.Value0C,
+				OuterSegmentCount: null,
+				InnerWriteCount: patternWriter.WriteCount,
+				Notes: $"Direct straight-line pattern writer stub ending at 0x{patternWriter.EndOffset:X}. Loads: ebx32={patternWriter.ImmediateEbx32LoadCount}, bl8={patternWriter.ImmediateBl8LoadCount}. Writes: dword={patternWriter.DwordWriteCount}, word={patternWriter.WordWriteCount}, byte={patternWriter.ByteWriteCount}, imm32={patternWriter.ImmediateDwordWriteCount}, imm8={patternWriter.ImmediateByteWriteCount}. Bounds: offsets 0x{patternWriter.MinOffset:X}..0x{patternWriter.MaxOffset:X}, crop {patternWriter.Width}x{patternWriter.Height} at ({patternWriter.MinX},{patternWriter.MinY})..({patternWriter.MaxX},{patternWriter.MaxY}).");
+		}
+
 		return new Type1PayloadBlockSummary(
 			BlockIndex: block.Index,
 			Family: Type1PayloadFamily.Unknown,
@@ -210,6 +228,205 @@ internal static class Type1PayloadProbeExporter
 		return new Type1OuterStreamSummary(rowGroupCount, rowCount, totalDwordCount, maxDwordCount);
 	}
 
+	private static bool TryParsePatternWriter(ReadOnlySpan<byte> bytes, int payloadOffset, out Type1PatternWriterSummary summary)
+	{
+		int cursor = payloadOffset;
+		uint ebx = 0;
+		int writeCount = 0;
+		int dwordWriteCount = 0;
+		int wordWriteCount = 0;
+		int byteWriteCount = 0;
+		int immediateDwordWriteCount = 0;
+		int immediateByteWriteCount = 0;
+		int immediateEbx32LoadCount = 0;
+		int immediateBl8LoadCount = 0;
+		int minOffset = int.MaxValue;
+		int maxOffset = 0;
+
+		while (cursor < bytes.Length)
+		{
+			byte opcode = bytes[cursor];
+			switch (opcode)
+			{
+				case 0xBB:
+					ebx = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(cursor + 1, sizeof(uint)));
+					immediateEbx32LoadCount++;
+					cursor += 5;
+					break;
+
+				case 0xB3:
+					ebx = (ebx & 0xFFFFFF00U) | bytes[cursor + 1];
+					immediateBl8LoadCount++;
+					cursor += 2;
+					break;
+
+				case 0x89 when bytes[cursor + 1] == 0x98:
+					RegisterWrite(ReadInt32(bytes, cursor + 2), sizeof(uint));
+					dwordWriteCount++;
+					writeCount++;
+					cursor += 6;
+					break;
+
+				case 0x89 when bytes[cursor + 1] == 0x18:
+					RegisterWrite(0, sizeof(uint));
+					dwordWriteCount++;
+					writeCount++;
+					cursor += 2;
+					break;
+
+				case 0x89 when bytes[cursor + 1] == 0x58:
+					RegisterWrite((sbyte)bytes[cursor + 2], sizeof(uint));
+					dwordWriteCount++;
+					writeCount++;
+					cursor += 3;
+					break;
+
+				case 0x88 when bytes[cursor + 1] == 0x98:
+					RegisterWrite(ReadInt32(bytes, cursor + 2), sizeof(byte));
+					byteWriteCount++;
+					writeCount++;
+					cursor += 6;
+					break;
+
+				case 0x88 when bytes[cursor + 1] == 0x18:
+					RegisterWrite(0, sizeof(byte));
+					byteWriteCount++;
+					writeCount++;
+					cursor += 2;
+					break;
+
+				case 0x88 when bytes[cursor + 1] == 0xB8:
+					RegisterWrite(ReadInt32(bytes, cursor + 2), sizeof(byte));
+					byteWriteCount++;
+					writeCount++;
+					cursor += 6;
+					break;
+
+				case 0x88 when bytes[cursor + 1] == 0x58:
+					RegisterWrite((sbyte)bytes[cursor + 2], sizeof(byte));
+					byteWriteCount++;
+					writeCount++;
+					cursor += 3;
+					break;
+
+				case 0x88 when bytes[cursor + 1] == 0x78:
+					RegisterWrite((sbyte)bytes[cursor + 2], sizeof(byte));
+					byteWriteCount++;
+					writeCount++;
+					cursor += 3;
+					break;
+
+				case 0x66 when bytes[cursor + 1] == 0x89 && bytes[cursor + 2] == 0x98:
+					RegisterWrite(ReadInt32(bytes, cursor + 3), sizeof(ushort));
+					wordWriteCount++;
+					writeCount++;
+					cursor += 7;
+					break;
+
+				case 0x66 when bytes[cursor + 1] == 0x89 && bytes[cursor + 2] == 0x18:
+					RegisterWrite(0, sizeof(ushort));
+					wordWriteCount++;
+					writeCount++;
+					cursor += 3;
+					break;
+
+				case 0x66 when bytes[cursor + 1] == 0x89 && bytes[cursor + 2] == 0x58:
+					RegisterWrite((sbyte)bytes[cursor + 3], sizeof(ushort));
+					wordWriteCount++;
+					writeCount++;
+					cursor += 4;
+					break;
+
+				case 0xC7 when bytes[cursor + 1] == 0x00:
+					RegisterWrite(0, sizeof(uint));
+					immediateDwordWriteCount++;
+					writeCount++;
+					cursor += 6;
+					break;
+
+				case 0xC7 when bytes[cursor + 1] == 0x80:
+					RegisterWrite(ReadInt32(bytes, cursor + 2), sizeof(uint));
+					immediateDwordWriteCount++;
+					writeCount++;
+					cursor += 10;
+					break;
+
+				case 0xC7 when bytes[cursor + 1] == 0x40:
+					RegisterWrite((sbyte)bytes[cursor + 2], sizeof(uint));
+					immediateDwordWriteCount++;
+					writeCount++;
+					cursor += 7;
+					break;
+
+				case 0xC6 when bytes[cursor + 1] == 0x00:
+					RegisterWrite(0, sizeof(byte));
+					immediateByteWriteCount++;
+					writeCount++;
+					cursor += 3;
+					break;
+
+				case 0xC6 when bytes[cursor + 1] == 0x80:
+					RegisterWrite(ReadInt32(bytes, cursor + 2), sizeof(byte));
+					immediateByteWriteCount++;
+					writeCount++;
+					cursor += 7;
+					break;
+
+				case 0xC6 when bytes[cursor + 1] == 0x40:
+					RegisterWrite((sbyte)bytes[cursor + 2], sizeof(byte));
+					immediateByteWriteCount++;
+					writeCount++;
+					cursor += 4;
+					break;
+
+				case 0xC3:
+					if (writeCount == 0)
+					{
+						summary = default!;
+						return false;
+					}
+
+					summary = new Type1PatternWriterSummary(
+						EndOffset: cursor + 1,
+						WriteCount: writeCount,
+						ImmediateEbx32LoadCount: immediateEbx32LoadCount,
+						ImmediateBl8LoadCount: immediateBl8LoadCount,
+						DwordWriteCount: dwordWriteCount,
+						WordWriteCount: wordWriteCount,
+						ByteWriteCount: byteWriteCount,
+						ImmediateDwordWriteCount: immediateDwordWriteCount,
+						ImmediateByteWriteCount: immediateByteWriteCount,
+						MinOffset: minOffset,
+						MaxOffset: maxOffset,
+						MinX: minOffset % RuntimeStride,
+						MinY: minOffset / RuntimeStride,
+						MaxX: maxOffset % RuntimeStride,
+						MaxY: maxOffset / RuntimeStride,
+						Width: (maxOffset % RuntimeStride) - (minOffset % RuntimeStride) + 1,
+						Height: (maxOffset / RuntimeStride) - (minOffset / RuntimeStride) + 1);
+					return true;
+
+				default:
+					summary = default!;
+					return false;
+			}
+		}
+
+		summary = default!;
+		return false;
+
+		void RegisterWrite(int destinationOffset, int byteCount)
+		{
+			if (destinationOffset < 0)
+			{
+				throw new InvalidDataException($"Pattern-writer payload at 0x{payloadOffset:X} writes to a negative destination offset {destinationOffset}.");
+			}
+
+			minOffset = Math.Min(minOffset, destinationOffset);
+			maxOffset = Math.Max(maxOffset, destinationOffset + byteCount - 1);
+		}
+	}
+
 	private static void ValidateBounds(ReadOnlySpan<byte> bytes, int startOffset, int byteCount, int blockIndex, string surfaceName)
 	{
 		if (startOffset < 0 || byteCount < 0 || startOffset + byteCount > bytes.Length)
@@ -280,6 +497,25 @@ internal sealed record Type1OuterStreamSummary(
 	int TotalDwordCount,
 	int MaxDwordCount);
 
+internal sealed record Type1PatternWriterSummary(
+	int EndOffset,
+	int WriteCount,
+	int ImmediateEbx32LoadCount,
+	int ImmediateBl8LoadCount,
+	int DwordWriteCount,
+	int WordWriteCount,
+	int ByteWriteCount,
+	int ImmediateDwordWriteCount,
+	int ImmediateByteWriteCount,
+	int MinOffset,
+	int MaxOffset,
+	int MinX,
+	int MinY,
+	int MaxX,
+	int MaxY,
+	int Width,
+	int Height);
+
 internal sealed record Type1PayloadBlockSummary(
 	int BlockIndex,
 	Type1PayloadFamily Family,
@@ -300,4 +536,5 @@ internal enum Type1PayloadFamily
 	Aligned16x16Copy,
 	VariableRowCopy,
 	ScatterWriteHelper,
+	PatternWriter,
 }

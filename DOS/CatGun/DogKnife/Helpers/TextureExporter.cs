@@ -6,9 +6,6 @@ namespace DogKnife.Helpers;
 
 internal static class TextureExporter
 {
-	private const int PaletteColorCount = 256;
-	private const int PaletteBankSize = PaletteColorCount * 3;
-
 	public static TextureExportResult Export(CatGunDat dat, string outputRoot)
 	{
 		DatResourceEntry resource = dat.Resources.SingleOrDefault(resource =>
@@ -28,37 +25,37 @@ internal static class TextureExporter
 		}
 
 		byte[] bytes = File.ReadAllBytes(dat.FilePath);
-		int paletteRegionLength = dat.Header.LayerTableOffset - dat.Header.PaletteTableOffset;
-		if (paletteRegionLength <= 0 || paletteRegionLength % PaletteBankSize != 0)
+		int? probePaletteBank = TryGetSharedPaletteBank(payloadGroup.Blocks, GetPaletteBankCount(dat));
+		IEnumerable<ExportPaletteVariant>? additionalVariants = probePaletteBank is int paletteBankIndex
+			? [new ExportPaletteVariant(paletteBankIndex, $"palette_bank_{paletteBankIndex:D2}_block_value20", "Shared high byte of block value20 across TEXTURE blocks (legacy heuristic).")]
+			: null;
+
+		if (!DatPaletteHelper.TryCreateContext(dat, out DatPaletteContext? paletteContext, out string? paletteFailureReason, additionalVariants))
 		{
 			throw new InvalidDataException(
-				$"TEXTURE export expects a palette region divisible by 0x{PaletteBankSize:X}. Actual length: 0x{paletteRegionLength:X}");
+				$"TEXTURE export expects a valid palette region. {paletteFailureReason}");
 		}
 
-		Rgba32[][] paletteBanks = ParsePaletteBanks(bytes, dat.Header.PaletteTableOffset, paletteRegionLength);
-		int? probePaletteBank = TryGetSharedPaletteBank(payloadGroup.Blocks, paletteBanks.Length);
+		DatPaletteHelper.ExportPaletteBankImages(Path.Combine(Path.GetFullPath(outputRoot), "TEXTURE"), paletteContext!);
 
 		string familyRoot = Path.Combine(Path.GetFullPath(outputRoot), "TEXTURE");
+		string defaultBlocksDirectory = Path.Combine(familyRoot, DatPaletteHelper.DefaultDirectoryName, "blocks");
+		string defaultFramesDirectory = Path.Combine(familyRoot, DatPaletteHelper.DefaultDirectoryName, "frames");
 		string grayscaleBlocksDirectory = Path.Combine(familyRoot, "grayscale", "blocks");
 		string grayscaleFramesDirectory = Path.Combine(familyRoot, "grayscale", "frames");
+		Directory.CreateDirectory(defaultBlocksDirectory);
+		Directory.CreateDirectory(defaultFramesDirectory);
 		Directory.CreateDirectory(grayscaleBlocksDirectory);
 		Directory.CreateDirectory(grayscaleFramesDirectory);
+		Rgba32[]? defaultPalette = paletteContext!.DefaultPalette;
 
-		string? paletteBlocksDirectory = null;
-		string? paletteFramesDirectory = null;
-		Rgba32[]? probePalette = null;
-
-		if (probePaletteBank is int paletteBankIndex)
+		foreach (ExportPaletteVariant paletteVariant in paletteContext!.Variants)
 		{
-			probePalette = paletteBanks[paletteBankIndex];
-			paletteBlocksDirectory = Path.Combine(familyRoot, $"palette_bank_{paletteBankIndex:D2}", "blocks");
-			paletteFramesDirectory = Path.Combine(familyRoot, $"palette_bank_{paletteBankIndex:D2}", "frames");
-			Directory.CreateDirectory(paletteBlocksDirectory);
-			Directory.CreateDirectory(paletteFramesDirectory);
+			Directory.CreateDirectory(Path.Combine(familyRoot, paletteVariant.DirectoryName, "blocks"));
+			Directory.CreateDirectory(Path.Combine(familyRoot, paletteVariant.DirectoryName, "frames"));
 		}
 
 		List<string> grayscaleBlockPaths = new(payloadGroup.Blocks.Count);
-		List<string> paletteBlockPaths = new(payloadGroup.Blocks.Count);
 
 		foreach (DatPayloadBlock30 block in payloadGroup.Blocks)
 		{
@@ -84,16 +81,21 @@ internal static class TextureExporter
 			string grayscaleBlockPath = Path.Combine(
 				grayscaleBlocksDirectory,
 				$"block_{block.Index:D2}_{width}x{height}_data_{dataOffset:X}.png");
+			string defaultBlockPath = Path.Combine(
+				defaultBlocksDirectory,
+				$"block_{block.Index:D2}_{width}x{height}_data_{dataOffset:X}.png");
+			SaveImage(defaultBlockPath, width, height, indices, defaultPalette);
 			SaveImage(grayscaleBlockPath, width, height, indices, palette: null);
 			grayscaleBlockPaths.Add(grayscaleBlockPath);
 
-			if (probePalette is not null && paletteBlocksDirectory is not null)
+			foreach (ExportPaletteVariant paletteVariant in paletteContext!.Variants)
 			{
 				string paletteBlockPath = Path.Combine(
-					paletteBlocksDirectory,
+					familyRoot,
+					paletteVariant.DirectoryName,
+					"blocks",
 					$"block_{block.Index:D2}_{width}x{height}_data_{dataOffset:X}.png");
-				SaveImage(paletteBlockPath, width, height, indices, probePalette);
-				paletteBlockPaths.Add(paletteBlockPath);
+				SaveImage(paletteBlockPath, width, height, indices, paletteContext.Banks[paletteVariant.BankIndex]);
 			}
 		}
 
@@ -116,14 +118,20 @@ internal static class TextureExporter
 			string grayscaleFramePath = Path.Combine(
 				grayscaleFramesDirectory,
 				$"frame_{frameIndex:D2}_block_{blockIndex:D2}.png");
+			string defaultFramePath = Path.Combine(
+				defaultFramesDirectory,
+				$"frame_{frameIndex:D2}_block_{blockIndex:D2}.png");
+			SaveImage(defaultFramePath, width, height, indices, defaultPalette);
 			SaveImage(grayscaleFramePath, width, height, indices, palette: null);
 
-			if (probePalette is not null && paletteFramesDirectory is not null)
+			foreach (ExportPaletteVariant paletteVariant in paletteContext!.Variants)
 			{
 				string paletteFramePath = Path.Combine(
-					paletteFramesDirectory,
+					familyRoot,
+					paletteVariant.DirectoryName,
+					"frames",
 					$"frame_{frameIndex:D2}_block_{blockIndex:D2}.png");
-				SaveImage(paletteFramePath, width, height, indices, probePalette);
+				SaveImage(paletteFramePath, width, height, indices, paletteContext.Banks[paletteVariant.BankIndex]);
 			}
 		}
 
@@ -133,7 +141,7 @@ internal static class TextureExporter
 			resource,
 			payloadGroup,
 			sequenceGroup,
-			paletteBanks.Length,
+			paletteContext,
 			probePaletteBank,
 			frameOrder);
 
@@ -141,33 +149,16 @@ internal static class TextureExporter
 			OutputDirectory: familyRoot,
 			BlockCount: payloadGroup.Blocks.Count,
 			FrameCount: frameOrder.Count,
-			PaletteBankCount: paletteBanks.Length,
-			ProbePaletteBank: probePaletteBank);
+			PaletteBankCount: paletteContext.PaletteBankCount,
+			ProbePaletteBank: probePaletteBank,
+			DefaultPaletteSummary: paletteContext.DefaultPaletteSummary,
+			ExportedPaletteVariants: paletteContext.Variants.Select(variant => $"{variant.DirectoryName}=bank{variant.BankIndex:D2}").ToArray());
 	}
 
-	private static Rgba32[][] ParsePaletteBanks(byte[] bytes, int paletteTableOffset, int paletteRegionLength)
+	private static int GetPaletteBankCount(CatGunDat dat)
 	{
-		int paletteBankCount = paletteRegionLength / PaletteBankSize;
-		Rgba32[][] banks = new Rgba32[paletteBankCount][];
-
-		for (int bankIndex = 0; bankIndex < paletteBankCount; bankIndex++)
-		{
-			int bankOffset = paletteTableOffset + (bankIndex * PaletteBankSize);
-			Rgba32[] colors = new Rgba32[PaletteColorCount];
-
-			for (int colorIndex = 0; colorIndex < PaletteColorCount; colorIndex++)
-			{
-				int colorOffset = bankOffset + (colorIndex * 3);
-				colors[colorIndex] = new Rgba32(
-					ExpandVgaColor(bytes[colorOffset + 0]),
-					ExpandVgaColor(bytes[colorOffset + 1]),
-					ExpandVgaColor(bytes[colorOffset + 2]));
-			}
-
-			banks[bankIndex] = colors;
-		}
-
-		return banks;
+		int paletteRegionLength = dat.Header.LayerTableOffset - dat.Header.PaletteTableOffset;
+		return paletteRegionLength <= 0 ? 0 : paletteRegionLength / (256 * 3);
 	}
 
 	private static int? TryGetSharedPaletteBank(IReadOnlyList<DatPayloadBlock30> blocks, int paletteBankCount)
@@ -195,11 +186,6 @@ internal static class TextureExporter
 		}
 
 		return paletteBank;
-	}
-
-	private static byte ExpandVgaColor(byte value)
-	{
-		return (byte)((value * 255) / 63);
 	}
 
 	private static void SaveImage(string outputPath, int width, int height, ReadOnlySpan<byte> indices, Rgba32[]? palette)
@@ -233,7 +219,7 @@ internal static class TextureExporter
 		DatResourceEntry resource,
 		DatPayloadGroup payloadGroup,
 		DatSequenceGroup? sequenceGroup,
-		int paletteBankCount,
+		DatPaletteContext paletteContext,
 		int? probePaletteBank,
 		IReadOnlyList<byte> frameOrder)
 	{
@@ -245,11 +231,15 @@ internal static class TextureExporter
 			$"Block count: {payloadGroup.Blocks.Count}",
 			$"Sequence group: {(sequenceGroup is null ? "<none>" : $"0x{sequenceGroup.StartOffset:X}..0x{sequenceGroup.EndOffset:X}")}",
 			$"Frame order: {(frameOrder.Count == 0 ? "<none>" : string.Join(' ', frameOrder.Select(value => value.ToString("X2"))))}",
-			$"Palette banks: {paletteBankCount}",
 			$"Probe palette bank: {(probePaletteBank is null ? "<none>" : probePaletteBank.Value.ToString())}",
+		];
+
+		DatPaletteHelper.AppendMetadata(lines, dat, paletteContext, paletteFailureReason: null);
+		lines.AddRange(
+		[
 			string.Empty,
 			"Blocks:",
-		];
+		]);
 
 		foreach (DatPayloadBlock30 block in payloadGroup.Blocks)
 		{
@@ -266,4 +256,6 @@ internal sealed record TextureExportResult(
 	int BlockCount,
 	int FrameCount,
 	int PaletteBankCount,
-	int? ProbePaletteBank);
+	int? ProbePaletteBank,
+	string DefaultPaletteSummary,
+	IReadOnlyList<string> ExportedPaletteVariants);

@@ -10,6 +10,11 @@ internal static class Type3RemapProbeExporter
 	private const int LookupPageSize = 0x100;
 	private const int RuntimeStride = 0x180;
 
+	public static bool SupportsResource(string resourceName)
+	{
+		return resourceName is "SHADOW_FRAMES";
+	}
+
 	public static Type3RemapProbeExportResult Export(CatGunDat dat, string resourceName, string outputRoot)
 	{
 		DatResourceEntry resource = dat.Resources.SingleOrDefault(candidate =>
@@ -100,7 +105,7 @@ internal static class Type3RemapProbeExporter
 			UniqueLookupPageCount: lookupPagePaths.Count);
 	}
 
-	private static Type3RemapStream ParseStream(ReadOnlySpan<byte> bytes, int streamOffset)
+	internal static Type3RemapStream ParseStream(ReadOnlySpan<byte> bytes, int streamOffset)
 	{
 		if (streamOffset <= 0 || streamOffset + sizeof(ushort) > bytes.Length)
 		{
@@ -147,7 +152,7 @@ internal static class Type3RemapProbeExporter
 			Segments: segments);
 	}
 
-	private static ReadOnlySpan<byte> GetLookupPage(ReadOnlySpan<byte> bytes, int lookupPageOffset)
+	internal static ReadOnlySpan<byte> GetLookupPage(ReadOnlySpan<byte> bytes, int lookupPageOffset)
 	{
 		if (lookupPageOffset <= 0 || lookupPageOffset + LookupPageSize > bytes.Length)
 		{
@@ -270,9 +275,17 @@ internal static class Type3RemapProbeExporter
 			$"Sequence group: {(sequenceGroup is null ? "<none>" : $"0x{sequenceGroup.StartOffset:X}..0x{sequenceGroup.EndOffset:X}")}",
 			$"Sequence bytes: {(frameOrder.Count == 0 ? "<none>" : string.Join(' ', frameOrder.Select(value => value.ToString("X2"))))}",
 			$"Runtime stride assumption: 0x{RuntimeStride:X} bytes (from FUN_00013100/FUN_00013430 destination setup)",
+			SupportsResource(resource.Name)
+				? "Exact remap-data note: this resource exposes only type-3 remap blocks and no same-resource direct base frames, so the exact export is the remap stream coverage plus lookup page data rather than a claimed final composited sprite."
+				: "",
 			string.Empty,
 			"Blocks:",
 		];
+
+		if (string.IsNullOrWhiteSpace(lines[8]))
+		{
+			lines.RemoveAt(8);
+		}
 
 		foreach (Type3RemapBlockSummary summary in blockSummaries)
 		{

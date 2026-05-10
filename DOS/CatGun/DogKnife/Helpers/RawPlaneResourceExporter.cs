@@ -6,9 +6,23 @@ namespace DogKnife.Helpers;
 
 internal static class RawPlaneResourceExporter
 {
-	private const int PaletteColorCount = 256;
-	private const int PaletteBankSize = PaletteColorCount * 3;
-	private static readonly HashSet<string> SupportedResourceNames = new(StringComparer.Ordinal);
+	private static readonly HashSet<string> SupportedResourceNames = new(StringComparer.Ordinal)
+	{
+		"DISPLAY",
+		"HALLBACK",
+		"INTROBCK",
+		"LETTERS",
+		"PAWBACK",
+		"LEVINFO0",
+		"LEVINFO1",
+		"LEVINFO2",
+		"TEXTURE_FRAMES",
+	};
+
+	public static bool SupportsResource(string resourceName)
+	{
+		return SupportedResourceNames.Contains(resourceName);
+	}
 
 	public static RawPlaneResourceExportResult Export(CatGunDat dat, string resourceName, string outputRoot)
 	{
@@ -21,7 +35,7 @@ internal static class RawPlaneResourceExporter
 		if (!SupportedResourceNames.Contains(resourceName))
 		{
 			throw new NotSupportedException(
-				$"{resourceName} is not supported by --export-resource-planes. Ghidra validation showed that PAW frame payloads are staged through FUN_00013040 and consumed by the queue processors at FUN_00012EA0/FUN_00012FE0 instead of being read as raw width*height indexed planes. Treat the generic raw-plane path as disabled until a family-specific decode path is proven.");
+				$"{resourceName} is not supported by --export-resource-planes. The exact type-4 plane path is currently limited to validated direct indexed-plane families such as DISPLAY, INTROBCK, HALLBACK, PAWBACK, TEXTURE_FRAMES, LETTERS, and LEVINFO0/1/2. Other families like PAW still stage payloads through queue helpers rather than a proven raw width*height indexed-plane path.");
 		}
 
 		DatResourceEntry resource = dat.Resources.SingleOrDefault(resource =>
@@ -40,37 +54,49 @@ internal static class RawPlaneResourceExporter
 			throw new InvalidDataException($"{resourceName} payload group does not contain any 0x30-byte blocks.");
 		}
 
-		byte[] bytes = File.ReadAllBytes(dat.FilePath);
-		int paletteRegionLength = dat.Header.LayerTableOffset - dat.Header.PaletteTableOffset;
-		if (paletteRegionLength <= 0 || paletteRegionLength % PaletteBankSize != 0)
+		List<DatPayloadBlock30> type4Blocks = payloadGroup.Blocks
+			.Where(block => block.LoaderType == 4)
+			.ToList();
+
+		if (type4Blocks.Count == 0)
+		{
+			throw new InvalidDataException($"{resourceName} does not expose any loader type-4 blocks in its current payload group.");
+		}
+
+		ReadOnlySpan<byte> bytes = dat.RawBytes.Span;
+		int? probePaletteBank = TryGetSharedPaletteBank(type4Blocks, GetPaletteBankCount(dat));
+		IEnumerable<ExportPaletteVariant>? additionalVariants = probePaletteBank is int probePaletteBankIndex
+			? [new ExportPaletteVariant(probePaletteBankIndex, $"palette_bank_{probePaletteBankIndex:D2}_block_value20", "Shared high byte of block value20 across exact type-4 plane blocks.")]
+			: null;
+
+		if (!DatPaletteHelper.TryCreateContext(dat, out DatPaletteContext? paletteContext, out string? paletteFailureReason, additionalVariants))
 		{
 			throw new InvalidDataException(
-				$"{resourceName} export expects a palette region divisible by 0x{PaletteBankSize:X}. Actual length: 0x{paletteRegionLength:X}");
+				$"{resourceName} export expects a valid palette region. {paletteFailureReason}");
 		}
 
-		Rgba32[][] paletteBanks = ParsePaletteBanks(bytes, dat.Header.PaletteTableOffset, paletteRegionLength);
-		int? probePaletteBank = TryGetSharedPaletteBank(payloadGroup.Blocks, paletteBanks.Length);
+		string familyRoot = Path.Combine(Path.GetFullPath(outputRoot), resourceName, "type4_plane");
+		DatPaletteHelper.ExportPaletteBankImages(familyRoot, paletteContext!);
 
-		string familyRoot = Path.Combine(Path.GetFullPath(outputRoot), resourceName);
+		string defaultBlocksDirectory = Path.Combine(familyRoot, DatPaletteHelper.DefaultDirectoryName, "blocks");
+		string defaultFramesDirectory = Path.Combine(familyRoot, DatPaletteHelper.DefaultDirectoryName, "frames");
 		string grayscaleBlocksDirectory = Path.Combine(familyRoot, "grayscale", "blocks");
 		string grayscaleFramesDirectory = Path.Combine(familyRoot, "grayscale", "frames");
+		Directory.CreateDirectory(defaultBlocksDirectory);
+		Directory.CreateDirectory(defaultFramesDirectory);
 		Directory.CreateDirectory(grayscaleBlocksDirectory);
 		Directory.CreateDirectory(grayscaleFramesDirectory);
+		Rgba32[]? defaultPalette = paletteContext!.DefaultPalette;
 
-		string? paletteBlocksDirectory = null;
-		string? paletteFramesDirectory = null;
-		Rgba32[]? probePalette = null;
-
-		if (probePaletteBank is int paletteBankIndex)
+		foreach (ExportPaletteVariant paletteVariant in paletteContext.Variants)
 		{
-			probePalette = paletteBanks[paletteBankIndex];
-			paletteBlocksDirectory = Path.Combine(familyRoot, $"palette_bank_{paletteBankIndex:D2}", "blocks");
-			paletteFramesDirectory = Path.Combine(familyRoot, $"palette_bank_{paletteBankIndex:D2}", "frames");
-			Directory.CreateDirectory(paletteBlocksDirectory);
-			Directory.CreateDirectory(paletteFramesDirectory);
+			Directory.CreateDirectory(Path.Combine(familyRoot, paletteVariant.DirectoryName, "blocks"));
+			Directory.CreateDirectory(Path.Combine(familyRoot, paletteVariant.DirectoryName, "frames"));
 		}
 
-		foreach (DatPayloadBlock30 block in payloadGroup.Blocks)
+		Dictionary<int, IndexedPlaneBlock> renderedBlocks = new(type4Blocks.Count);
+
+		foreach (DatPayloadBlock30 block in type4Blocks)
 		{
 			int width = block.Value08;
 			int height = block.Value0C;
@@ -89,50 +115,70 @@ internal static class RawPlaneResourceExporter
 					$"{resourceName} block {block.Index} pixel data exceeds file bounds: offset=0x{dataOffset:X}, size=0x{pixelCount:X}");
 			}
 
-			ReadOnlySpan<byte> indices = bytes.AsSpan(dataOffset, pixelCount);
+			ReadOnlySpan<byte> indices = bytes.Slice(dataOffset, pixelCount);
+			renderedBlocks.Add(block.Index, new IndexedPlaneBlock(block.Index, width, height, dataOffset));
 
+			string defaultBlockPath = Path.Combine(
+				defaultBlocksDirectory,
+				$"block_{block.Index:D2}_{width}x{height}_data_{dataOffset:X}.png");
 			string grayscaleBlockPath = Path.Combine(
 				grayscaleBlocksDirectory,
 				$"block_{block.Index:D2}_{width}x{height}_data_{dataOffset:X}.png");
+			SaveImage(defaultBlockPath, width, height, indices, defaultPalette);
 			SaveImage(grayscaleBlockPath, width, height, indices, palette: null);
 
-			if (probePalette is not null && paletteBlocksDirectory is not null)
+			foreach (ExportPaletteVariant paletteVariant in paletteContext.Variants)
 			{
 				string paletteBlockPath = Path.Combine(
-					paletteBlocksDirectory,
+					familyRoot,
+					paletteVariant.DirectoryName,
+					"blocks",
 					$"block_{block.Index:D2}_{width}x{height}_data_{dataOffset:X}.png");
-				SaveImage(paletteBlockPath, width, height, indices, probePalette);
+				SaveImage(paletteBlockPath, width, height, indices, paletteContext.Banks[paletteVariant.BankIndex]);
 			}
 		}
 
 		List<byte> frameOrder = sequenceGroup?.Segments.SelectMany(segment => segment.Bytes).ToList() ?? [];
+		int frameCount = 0;
+		int skippedFrameCount = 0;
+
 		for (int frameIndex = 0; frameIndex < frameOrder.Count; frameIndex++)
 		{
 			byte blockIndex = frameOrder[frameIndex];
+			if (!renderedBlocks.TryGetValue(blockIndex, out IndexedPlaneBlock? block))
+			{
+				skippedFrameCount++;
+				continue;
+			}
+
 			if (blockIndex >= payloadGroup.Blocks.Count)
 			{
 				throw new InvalidDataException(
 					$"{resourceName} sequence frame {frameIndex} references block {blockIndex}, but only {payloadGroup.Blocks.Count} blocks were parsed.");
 			}
 
-			DatPayloadBlock30 block = payloadGroup.Blocks[blockIndex];
-			int width = block.Value08;
-			int height = block.Value0C;
-			int dataOffset = block.Value24;
-			ReadOnlySpan<byte> indices = bytes.AsSpan(dataOffset, checked(width * height));
+			ReadOnlySpan<byte> indices = bytes.Slice(block.DataOffset, checked(block.Width * block.Height));
 
+			string defaultFramePath = Path.Combine(
+				defaultFramesDirectory,
+				$"frame_{frameIndex:D2}_block_{blockIndex:D2}.png");
 			string grayscaleFramePath = Path.Combine(
 				grayscaleFramesDirectory,
 				$"frame_{frameIndex:D2}_block_{blockIndex:D2}.png");
-			SaveImage(grayscaleFramePath, width, height, indices, palette: null);
+			SaveImage(defaultFramePath, block.Width, block.Height, indices, defaultPalette);
+			SaveImage(grayscaleFramePath, block.Width, block.Height, indices, palette: null);
 
-			if (probePalette is not null && paletteFramesDirectory is not null)
+			foreach (ExportPaletteVariant paletteVariant in paletteContext.Variants)
 			{
 				string paletteFramePath = Path.Combine(
-					paletteFramesDirectory,
+					familyRoot,
+					paletteVariant.DirectoryName,
+					"frames",
 					$"frame_{frameIndex:D2}_block_{blockIndex:D2}.png");
-				SaveImage(paletteFramePath, width, height, indices, probePalette);
+				SaveImage(paletteFramePath, block.Width, block.Height, indices, paletteContext.Banks[paletteVariant.BankIndex]);
 			}
+
+			frameCount++;
 		}
 
 		WriteMetadata(
@@ -140,43 +186,30 @@ internal static class RawPlaneResourceExporter
 			dat,
 			resource,
 			payloadGroup,
+			type4Blocks,
 			sequenceGroup,
-			paletteBanks.Length,
+			paletteContext!,
 			probePaletteBank,
+			frameCount,
+			skippedFrameCount,
 			frameOrder);
 
 		return new RawPlaneResourceExportResult(
 			ResourceName: resourceName,
 			OutputDirectory: familyRoot,
-			BlockCount: payloadGroup.Blocks.Count,
-			FrameCount: frameOrder.Count,
-			PaletteBankCount: paletteBanks.Length,
-			ProbePaletteBank: probePaletteBank);
+			BlockCount: type4Blocks.Count,
+			FrameCount: frameCount,
+			SkippedFrameCount: skippedFrameCount,
+			PaletteBankCount: paletteContext!.PaletteBankCount,
+			ProbePaletteBank: probePaletteBank,
+			DefaultPaletteSummary: paletteContext.DefaultPaletteSummary,
+			ExportedPaletteVariants: paletteContext.Variants.Select(variant => $"{variant.DirectoryName}=bank{variant.BankIndex:D2}").ToArray());
 	}
 
-	private static Rgba32[][] ParsePaletteBanks(byte[] bytes, int paletteTableOffset, int paletteRegionLength)
+	private static int GetPaletteBankCount(CatGunDat dat)
 	{
-		int paletteBankCount = paletteRegionLength / PaletteBankSize;
-		Rgba32[][] banks = new Rgba32[paletteBankCount][];
-
-		for (int bankIndex = 0; bankIndex < paletteBankCount; bankIndex++)
-		{
-			int bankOffset = paletteTableOffset + (bankIndex * PaletteBankSize);
-			Rgba32[] colors = new Rgba32[PaletteColorCount];
-
-			for (int colorIndex = 0; colorIndex < PaletteColorCount; colorIndex++)
-			{
-				int colorOffset = bankOffset + (colorIndex * 3);
-				colors[colorIndex] = new Rgba32(
-					ExpandVgaColor(bytes[colorOffset + 0]),
-					ExpandVgaColor(bytes[colorOffset + 1]),
-					ExpandVgaColor(bytes[colorOffset + 2]));
-			}
-
-			banks[bankIndex] = colors;
-		}
-
-		return banks;
+		int paletteRegionLength = dat.Header.LayerTableOffset - dat.Header.PaletteTableOffset;
+		return paletteRegionLength <= 0 ? 0 : paletteRegionLength / (256 * 3);
 	}
 
 	private static int? TryGetSharedPaletteBank(IReadOnlyList<DatPayloadBlock30> blocks, int paletteBankCount)
@@ -204,11 +237,6 @@ internal static class RawPlaneResourceExporter
 		}
 
 		return paletteBank;
-	}
-
-	private static byte ExpandVgaColor(byte value)
-	{
-		return (byte)((value * 255) / 63);
 	}
 
 	private static void SaveImage(string outputPath, int width, int height, ReadOnlySpan<byte> indices, Rgba32[]? palette)
@@ -241,26 +269,45 @@ internal static class RawPlaneResourceExporter
 		CatGunDat dat,
 		DatResourceEntry resource,
 		DatPayloadGroup payloadGroup,
+		IReadOnlyList<DatPayloadBlock30> type4Blocks,
 		DatSequenceGroup? sequenceGroup,
-		int paletteBankCount,
+		DatPaletteContext paletteContext,
 		int? probePaletteBank,
+		int frameCount,
+		int skippedFrameCount,
 		IReadOnlyList<byte> frameOrder)
 	{
+		string loaderTypes = string.Join(
+			", ",
+			payloadGroup.Blocks
+				.GroupBy(block => block.LoaderType)
+				.OrderBy(group => group.Key)
+				.Select(group => $"0x{group.Key:X2}:{group.Count()}"));
+
 		List<string> lines =
 		[
 			$"DAT: {dat.FilePath}",
 			$"Resource: {resource.Name}",
 			$"Payload group: 0x{payloadGroup.StartOffset:X}..0x{payloadGroup.EndOffset:X}",
-			$"Block count: {payloadGroup.Blocks.Count}",
+			$"Payload block count: {payloadGroup.Blocks.Count}",
+			$"Loader types: {loaderTypes}",
+			$"Exact type-4 block count: {type4Blocks.Count}",
 			$"Sequence group: {(sequenceGroup is null ? "<none>" : $"0x{sequenceGroup.StartOffset:X}..0x{sequenceGroup.EndOffset:X}")}",
 			$"Frame order: {(frameOrder.Count == 0 ? "<none>" : string.Join(' ', frameOrder.Select(value => value.ToString("X2"))))}",
-			$"Palette banks: {paletteBankCount}",
+			$"Exported type-4 frames: {frameCount}",
+			$"Skipped non-type-4 frames: {skippedFrameCount}",
 			$"Probe palette bank: {(probePaletteBank is null ? "<none>" : probePaletteBank.Value.ToString())}",
-			string.Empty,
-			"Blocks:",
+			"Exact plane note: this path exports only loader type-4 width*height indexed planes proven by the raw DAT payloads; sequence entries that point at non-type-4 blocks are skipped rather than guessed.",
 		];
 
-		foreach (DatPayloadBlock30 block in payloadGroup.Blocks)
+		DatPaletteHelper.AppendMetadata(lines, dat, paletteContext, paletteFailureReason: null);
+		lines.AddRange(
+		[
+			string.Empty,
+			"Type-4 blocks:",
+		]);
+
+		foreach (DatPayloadBlock30 block in type4Blocks)
 		{
 			lines.Add(
 				$"[{block.Index:D2}] size={block.Value08}x{block.Value0C} data=0x{block.Value24:X} value20=0x{block.Value20:X8} value00=0x{block.Value00:X8} value04=0x{block.Value04:X8}");
@@ -276,4 +323,13 @@ internal sealed record RawPlaneResourceExportResult(
 	int BlockCount,
 	int FrameCount,
 	int PaletteBankCount,
-	int? ProbePaletteBank);
+	int SkippedFrameCount,
+	int? ProbePaletteBank,
+	string DefaultPaletteSummary,
+	IReadOnlyList<string> ExportedPaletteVariants);
+
+internal sealed record IndexedPlaneBlock(
+	int BlockIndex,
+	int Width,
+	int Height,
+	int DataOffset);
